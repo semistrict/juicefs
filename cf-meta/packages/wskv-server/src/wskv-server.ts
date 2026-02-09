@@ -97,7 +97,13 @@ export class WskvServer {
   private handleCommit(req: CommitRequest): WskvMessage {
     const result = dbCommit(
       this.storage,
-      req.observed.map((obs) => ({ key: obs.key, ver: obs.ver })),
+      req.reads.map((rng) => ({
+        start: rng.start,
+        end: rng.end,
+        entries: rng.entries.map((e) => ({ key: e.key, ver: e.ver })),
+        keysOnly: rng.keysOnly,
+        limit: rng.limit,
+      })),
       req.puts.map((put) => ({ key: put.key, value: put.value })),
       req.dels,
     );

@@ -93,6 +93,11 @@ func (tx *memTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byt
 	})
 }
 
+// nextKey returns the next key after all keys sharing the same prefix as key.
+// It increments the last byte (with carry), so nextKey("ab") = "ac" — this
+// means the range [key, nextKey(key)) includes keys like "ab\x01", "ab\xff", etc.
+// For a single-key point read, use pointKeyEnd (append \x00) instead:
+// [key, pointKeyEnd(key)) matches exactly one key.
 func nextKey(key []byte) []byte {
 	if len(key) == 0 {
 		return nil

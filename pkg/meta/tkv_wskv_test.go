@@ -19,8 +19,11 @@ package meta
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"testing"
 
 	"github.com/gorilla/websocket"
@@ -75,26 +78,100 @@ func connectWskv(t *testing.T, addr string) *wskvClient {
 	return client
 }
 
-func TestWskvTKV(t *testing.T) {
-	_, addr, cleanup := startWskvServer(t)
-	defer cleanup()
+// startCFWskvServer starts a local WebSocket listener, then kicks the
+// Cloudflare TS worker at cfURL to connect back to it. The TS Durable Object
+// connects to our listener and wires up its WskvServer (backed by real DO
+// SQLite). Returns a wskvClient using the accepted connection.
+func startCFWskvServer(t *testing.T, cfURL string) (*wskvClient, func()) {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	wsCh := make(chan *websocket.Conn, 1)
 
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		wsCh <- ws
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := &http.Server{Handler: mux}
+	go httpServer.Serve(listener) //nolint:errcheck
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	target := fmt.Sprintf("ws://127.0.0.1:%d/ws", port)
+
+	// Kick the TS worker to connect to our listener. Pass test name so each
+	// test gets a fresh Durable Object instance with clean SQLite state.
+	kickURL := fmt.Sprintf("%s/connect?target=%s&name=%s", cfURL, url.QueryEscape(target), url.QueryEscape(t.Name()))
+	resp, err := http.Get(kickURL) //nolint:gosec
+	if err != nil {
+		listener.Close()
+		t.Fatalf("kick TS server: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		listener.Close()
+		t.Fatalf("kick TS server: status %d: %s", resp.StatusCode, body)
+	}
+
+	ws := <-wsCh
+
+	client := &wskvClient{
+		ready: make(chan struct{}),
+	}
+	client.ws = ws
+	close(client.ready)
+	go client.readLoop()
+
+	cleanup := func() {
+		client.close()
+		httpServer.Close()
+		listener.Close()
+	}
+	return client, cleanup
+}
+
+// wskvClient connects to the Go in-memory WskvServer, or to the Cloudflare TS
+// WskvServer if WSKV_CF_URL is set (e.g. WSKV_CF_URL=http://localhost:8787).
+func newTestWskvClient(t *testing.T) (*wskvClient, func()) {
+	t.Helper()
+	cfURL := os.Getenv("WSKV_CF_URL")
+	if cfURL != "" {
+		t.Logf("using Cloudflare TS server at %s", cfURL)
+		return startCFWskvServer(t, cfURL)
+	}
+	_, addr, serverCleanup := startWskvServer(t)
 	client := connectWskv(t, addr)
-	defer client.close()
+	cleanup := func() {
+		client.close()
+		serverCleanup()
+	}
+	return client, cleanup
+}
+
+func TestWskvTKV(t *testing.T) {
+	client, cleanup := newTestWskvClient(t)
+	defer cleanup()
 
 	c := withPrefix(client, []byte("jfs"))
 	testTKV(t, c)
 }
 
 func TestWskvMeta(t *testing.T) {
-	_, addr, cleanup := startWskvServer(t)
+	client, cleanup := newTestWskvClient(t)
 	defer cleanup()
 
 	// Set the global client so newWskvClient returns it.
 	oldClient := globalWskvClient
 	defer func() { globalWskvClient = oldClient }()
-
-	client := connectWskv(t, addr)
 	globalWskvClient = client
 
 	m, err := newKVMeta("wskv", "jfs-unit-test", testConfig())

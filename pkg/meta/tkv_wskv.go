@@ -179,11 +179,34 @@ func (c *wskvClient) close() error {
 }
 
 // wskvTxn implements kvtxn with OCC: reads go to the remote store and record
-// versions, writes are buffered locally, and commit sends everything in one shot.
+// ranges, writes are buffered locally, and commit sends everything in one shot.
+// Each read (point get or range scan) records a readRange so the server can
+// re-scan and detect phantom reads at commit time.
 type wskvTxn struct {
-	client   *wskvClient
-	observed map[string]uint32 // raw key (as string) → version
-	buffer   map[string][]byte // raw key (as string) → value (nil = delete)
+	client *wskvClient
+	reads  []readRange        // ranges read during this transaction
+	buffer map[string][]byte  // raw key (as string) → value (nil = delete)
+}
+
+type readRange struct {
+	start    []byte
+	end      []byte
+	entries  []readEntry
+	keysOnly bool
+	limit    uint32
+}
+
+type readEntry struct {
+	key []byte
+	ver uint32
+}
+
+// pointKeyEnd returns the exclusive upper bound for a single-key range.
+// For key K, the range [K, K\x00) matches only K.
+func pointKeyEnd(key []byte) []byte {
+	end := make([]byte, len(key)+1)
+	copy(end, key)
+	return end
 }
 
 func (tx *wskvTxn) get(key []byte) []byte {
@@ -197,19 +220,18 @@ func (tx *wskvTxn) get(key []byte) []byte {
 			Key: key,
 		}},
 	})
+	rng := readRange{start: key, end: pointKeyEnd(key)}
 	if err != nil {
-		tx.observed[k] = 0
+		tx.reads = append(tx.reads, rng)
 		return nil
 	}
 	r := resp.GetGetResp()
-	if r == nil {
-		tx.observed[k] = 0
+	if r == nil || !r.Found {
+		tx.reads = append(tx.reads, rng)
 		return nil
 	}
-	tx.observed[k] = r.Ver
-	if !r.Found {
-		return nil
-	}
+	rng.entries = []readEntry{{key: key, ver: r.Ver}}
+	tx.reads = append(tx.reads, rng)
 	return r.Value
 }
 
@@ -230,15 +252,21 @@ func (tx *wskvTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []by
 			KeysOnly: keysOnly,
 		}},
 	})
+	rng := readRange{start: begin, end: end, keysOnly: keysOnly}
 	if err != nil {
+		tx.reads = append(tx.reads, rng)
 		return
 	}
 	r := resp.GetListResp()
 	if r == nil {
+		tx.reads = append(tx.reads, rng)
 		return
 	}
 	for _, entry := range r.Entries {
-		tx.observed[string(entry.Key)] = entry.Ver
+		rng.entries = append(rng.entries, readEntry{key: entry.Key, ver: entry.Ver})
+	}
+	tx.reads = append(tx.reads, rng)
+	for _, entry := range r.Entries {
 		if !handler(entry.Key, entry.Value) {
 			break
 		}
@@ -256,16 +284,20 @@ func (tx *wskvTxn) exist(prefix []byte) bool {
 			Limit:    1,
 		}},
 	})
+	rng := readRange{start: prefix, end: end, keysOnly: true, limit: 1}
 	if err != nil {
+		tx.reads = append(tx.reads, rng)
 		return false
 	}
 	r := resp.GetListResp()
 	if r == nil {
+		tx.reads = append(tx.reads, rng)
 		return false
 	}
 	for _, entry := range r.Entries {
-		tx.observed[string(entry.Key)] = entry.Ver
+		rng.entries = append(rng.entries, readEntry{key: entry.Key, ver: entry.Ver})
 	}
+	tx.reads = append(tx.reads, rng)
 	return len(r.Entries) > 0
 }
 
@@ -294,9 +326,8 @@ func (tx *wskvTxn) delete(key []byte) {
 
 func (c *wskvClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) error {
 	tx := &wskvTxn{
-		client:   c,
-		observed: make(map[string]uint32),
-		buffer:   make(map[string][]byte),
+		client: c,
+		buffer: make(map[string][]byte),
 	}
 	if err := f(&kvTxn{tx, retry}); err != nil {
 		return err
@@ -306,9 +337,19 @@ func (c *wskvClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) e
 	}
 
 	// Build commit message
-	var observed []*pb.Observed
-	for k, ver := range tx.observed {
-		observed = append(observed, &pb.Observed{Key: []byte(k), Ver: ver})
+	var reads []*pb.ReadRange
+	for _, rng := range tx.reads {
+		var entries []*pb.ReadEntry
+		for _, e := range rng.entries {
+			entries = append(entries, &pb.ReadEntry{Key: e.key, Ver: e.ver})
+		}
+		reads = append(reads, &pb.ReadRange{
+			Start:    rng.start,
+			End:      rng.end,
+			Entries:  entries,
+			KeysOnly: rng.keysOnly,
+			Limit:    rng.limit,
+		})
 	}
 	var puts []*pb.Put
 	var dels [][]byte
@@ -322,10 +363,10 @@ func (c *wskvClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) e
 
 	resp, err := c.send(&pb.WskvMessage{
 		Msg: &pb.WskvMessage_CommitReq{CommitReq: &pb.CommitRequest{
-			Id:       c.nextID(),
-			Observed: observed,
-			Puts:     puts,
-			Dels:     dels,
+			Id:    c.nextID(),
+			Reads: reads,
+			Puts:  puts,
+			Dels:  dels,
 		}},
 	})
 	if err != nil {

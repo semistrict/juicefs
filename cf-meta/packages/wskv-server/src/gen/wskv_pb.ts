@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file wskv.proto.
  */
 export const file_wskv: GenFile = /*@__PURE__*/
-  fileDesc("Cgp3c2t2LnByb3RvEgJwYiIlCgpHZXRSZXF1ZXN0EgoKAmlkGAEgASgEEgsKA2tleRgCIAEoDCJXCgtMaXN0UmVxdWVzdBIKCgJpZBgBIAEoBBINCgVzdGFydBgCIAEoDBILCgNlbmQYAyABKAwSEQoJa2V5c19vbmx5GAQgASgIEg0KBWxpbWl0GAUgASgNImAKDUNvbW1pdFJlcXVlc3QSCgoCaWQYASABKAQSHgoIb2JzZXJ2ZWQYAiADKAsyDC5wYi5PYnNlcnZlZBIVCgRwdXRzGAMgAygLMgcucGIuUHV0EgwKBGRlbHMYBCADKAwiGgoMUmVzZXRSZXF1ZXN0EgoKAmlkGAEgASgEInAKEEluaXROb3RpZmljYXRpb24SDwoHc3RvcmFnZRgBIAEoCRIOCgZidWNrZXQYAiABKAkSEgoKYWNjZXNzX2tleRgDIAEoCRISCgpzZWNyZXRfa2V5GAQgASgJEhMKC3ZvbHVtZV9uYW1lGAUgASgJIhMKEVJlYWR5Tm90aWZpY2F0aW9uIkQKC0dldFJlc3BvbnNlEgoKAmlkGAEgASgEEg0KBXZhbHVlGAIgASgMEgsKA3ZlchgDIAEoDRINCgVmb3VuZBgEIAEoCCI2CgxMaXN0UmVzcG9uc2USCgoCaWQYASABKAQSGgoHZW50cmllcxgCIAMoCzIJLnBiLkVudHJ5IjcKDkNvbW1pdFJlc3BvbnNlEgoKAmlkGAEgASgEEgoKAm9rGAIgASgIEg0KBWVycm9yGAMgASgJIjYKDVJlc2V0UmVzcG9uc2USCgoCaWQYASABKAQSCgoCb2sYAiABKAgSDQoFZXJyb3IYAyABKAkiqAMKC1dza3ZNZXNzYWdlEiEKB2dldF9yZXEYASABKAsyDi5wYi5HZXRSZXF1ZXN0SAASIwoIbGlzdF9yZXEYAiABKAsyDy5wYi5MaXN0UmVxdWVzdEgAEicKCmNvbW1pdF9yZXEYAyABKAsyES5wYi5Db21taXRSZXF1ZXN0SAASJQoJcmVzZXRfcmVxGAQgASgLMhAucGIuUmVzZXRSZXF1ZXN0SAASIwoIZ2V0X3Jlc3AYCiABKAsyDy5wYi5HZXRSZXNwb25zZUgAEiUKCWxpc3RfcmVzcBgLIAEoCzIQLnBiLkxpc3RSZXNwb25zZUgAEikKC2NvbW1pdF9yZXNwGAwgASgLMhIucGIuQ29tbWl0UmVzcG9uc2VIABInCgpyZXNldF9yZXNwGA0gASgLMhEucGIuUmVzZXRSZXNwb25zZUgAEisKC2luaXRfbm90aWZ5GBQgASgLMhQucGIuSW5pdE5vdGlmaWNhdGlvbkgAEi0KDHJlYWR5X25vdGlmeRgVIAEoCzIVLnBiLlJlYWR5Tm90aWZpY2F0aW9uSABCBQoDbXNnIiQKCE9ic2VydmVkEgsKA2tleRgBIAEoDBILCgN2ZXIYAiABKA0iIQoDUHV0EgsKA2tleRgBIAEoDBINCgV2YWx1ZRgCIAEoDCIwCgVFbnRyeRILCgNrZXkYASABKAwSDQoFdmFsdWUYAiABKAwSCwoDdmVyGAMgASgNQgZaBC4vcGJiBnByb3RvMw");
+  fileDesc("Cgp3c2t2LnByb3RvEgJwYiIlCgpHZXRSZXF1ZXN0EgoKAmlkGAEgASgEEgsKA2tleRgCIAEoDCJXCgtMaXN0UmVxdWVzdBIKCgJpZBgBIAEoBBINCgVzdGFydBgCIAEoDBILCgNlbmQYAyABKAwSEQoJa2V5c19vbmx5GAQgASgIEg0KBWxpbWl0GAUgASgNIl4KDUNvbW1pdFJlcXVlc3QSCgoCaWQYASABKAQSHAoFcmVhZHMYAiADKAsyDS5wYi5SZWFkUmFuZ2USFQoEcHV0cxgDIAMoCzIHLnBiLlB1dBIMCgRkZWxzGAQgAygMIhoKDFJlc2V0UmVxdWVzdBIKCgJpZBgBIAEoBCJwChBJbml0Tm90aWZpY2F0aW9uEg8KB3N0b3JhZ2UYASABKAkSDgoGYnVja2V0GAIgASgJEhIKCmFjY2Vzc19rZXkYAyABKAkSEgoKc2VjcmV0X2tleRgEIAEoCRITCgt2b2x1bWVfbmFtZRgFIAEoCSITChFSZWFkeU5vdGlmaWNhdGlvbiJECgtHZXRSZXNwb25zZRIKCgJpZBgBIAEoBBINCgV2YWx1ZRgCIAEoDBILCgN2ZXIYAyABKA0SDQoFZm91bmQYBCABKAgiNgoMTGlzdFJlc3BvbnNlEgoKAmlkGAEgASgEEhoKB2VudHJpZXMYAiADKAsyCS5wYi5FbnRyeSI3Cg5Db21taXRSZXNwb25zZRIKCgJpZBgBIAEoBBIKCgJvaxgCIAEoCBINCgVlcnJvchgDIAEoCSI2Cg1SZXNldFJlc3BvbnNlEgoKAmlkGAEgASgEEgoKAm9rGAIgASgIEg0KBWVycm9yGAMgASgJIqgDCgtXc2t2TWVzc2FnZRIhCgdnZXRfcmVxGAEgASgLMg4ucGIuR2V0UmVxdWVzdEgAEiMKCGxpc3RfcmVxGAIgASgLMg8ucGIuTGlzdFJlcXVlc3RIABInCgpjb21taXRfcmVxGAMgASgLMhEucGIuQ29tbWl0UmVxdWVzdEgAEiUKCXJlc2V0X3JlcRgEIAEoCzIQLnBiLlJlc2V0UmVxdWVzdEgAEiMKCGdldF9yZXNwGAogASgLMg8ucGIuR2V0UmVzcG9uc2VIABIlCglsaXN0X3Jlc3AYCyABKAsyEC5wYi5MaXN0UmVzcG9uc2VIABIpCgtjb21taXRfcmVzcBgMIAEoCzISLnBiLkNvbW1pdFJlc3BvbnNlSAASJwoKcmVzZXRfcmVzcBgNIAEoCzIRLnBiLlJlc2V0UmVzcG9uc2VIABIrCgtpbml0X25vdGlmeRgUIAEoCzIULnBiLkluaXROb3RpZmljYXRpb25IABItCgxyZWFkeV9ub3RpZnkYFSABKAsyFS5wYi5SZWFkeU5vdGlmaWNhdGlvbkgAQgUKA21zZyJpCglSZWFkUmFuZ2USDQoFc3RhcnQYASABKAwSCwoDZW5kGAIgASgMEh4KB2VudHJpZXMYAyADKAsyDS5wYi5SZWFkRW50cnkSEQoJa2V5c19vbmx5GAQgASgIEg0KBWxpbWl0GAUgASgNIiUKCVJlYWRFbnRyeRILCgNrZXkYASABKAwSCwoDdmVyGAIgASgNIiEKA1B1dBILCgNrZXkYASABKAwSDQoFdmFsdWUYAiABKAwiMAoFRW50cnkSCwoDa2V5GAEgASgMEg0KBXZhbHVlGAIgASgMEgsKA3ZlchgDIAEoDUIGWgQuL3BiYgZwcm90bzM");
 
 /**
  * GetRequest fetches a single key's value and version from the store.
@@ -92,12 +92,12 @@ export const ListRequestSchema: GenMessage<ListRequest> = /*@__PURE__*/
 
 /**
  * CommitRequest atomically applies a set of writes after verifying that
- * no observed keys have been modified since they were read.
+ * no read ranges have been modified since they were read.
  *
  * The server executes this inside a single synchronous transaction:
- *   1. For each entry in observed: verify the key's current version matches.
- *      If any version differs (or a key was created/deleted), the commit
- *      fails with "write conflict" and no changes are applied.
+ *   1. For each ReadRange in reads: re-scan [start, end) and verify that
+ *      the current set of (key, version) pairs matches exactly. If any key
+ *      was added, removed, or modified, the commit fails with "write conflict".
  *   2. For each entry in puts: upsert the key with the new value and
  *      increment its version.
  *   3. For each key in dels: delete the key from the store.
@@ -114,9 +114,9 @@ export type CommitRequest = Message<"pb.CommitRequest"> & {
   id: bigint;
 
   /**
-   * @generated from field: repeated pb.Observed observed = 2;
+   * @generated from field: repeated pb.ReadRange reads = 2;
    */
-  observed: Observed[];
+  reads: ReadRange[];
 
   /**
    * @generated from field: repeated pb.Put puts = 3;
@@ -410,9 +410,61 @@ export const WskvMessageSchema: GenMessage<WskvMessage> = /*@__PURE__*/
   messageDesc(file_wskv, 10);
 
 /**
- * @generated from message pb.Observed
+ * ReadRange captures a range [start, end) that was read during a transaction,
+ * along with the exact set of (key, version) entries found at read time.
+ * At commit, the server re-scans each range and verifies the entries match.
+ * A point get(key) is represented as [key, nextKey(key)) with 0 or 1 entry.
+ *
+ * @generated from message pb.ReadRange
  */
-export type Observed = Message<"pb.Observed"> & {
+export type ReadRange = Message<"pb.ReadRange"> & {
+  /**
+   * inclusive
+   *
+   * @generated from field: bytes start = 1;
+   */
+  start: Uint8Array;
+
+  /**
+   * exclusive
+   *
+   * @generated from field: bytes end = 2;
+   */
+  end: Uint8Array;
+
+  /**
+   * sorted entries found at read time
+   *
+   * @generated from field: repeated pb.ReadEntry entries = 3;
+   */
+  entries: ReadEntry[];
+
+  /**
+   * when true, only check key presence, ignore version changes
+   *
+   * @generated from field: bool keys_only = 4;
+   */
+  keysOnly: boolean;
+
+  /**
+   * 0 = no limit; mirrors the limit used at read time
+   *
+   * @generated from field: uint32 limit = 5;
+   */
+  limit: number;
+};
+
+/**
+ * Describes the message pb.ReadRange.
+ * Use `create(ReadRangeSchema)` to create a new message.
+ */
+export const ReadRangeSchema: GenMessage<ReadRange> = /*@__PURE__*/
+  messageDesc(file_wskv, 11);
+
+/**
+ * @generated from message pb.ReadEntry
+ */
+export type ReadEntry = Message<"pb.ReadEntry"> & {
   /**
    * @generated from field: bytes key = 1;
    */
@@ -425,11 +477,11 @@ export type Observed = Message<"pb.Observed"> & {
 };
 
 /**
- * Describes the message pb.Observed.
- * Use `create(ObservedSchema)` to create a new message.
+ * Describes the message pb.ReadEntry.
+ * Use `create(ReadEntrySchema)` to create a new message.
  */
-export const ObservedSchema: GenMessage<Observed> = /*@__PURE__*/
-  messageDesc(file_wskv, 11);
+export const ReadEntrySchema: GenMessage<ReadEntry> = /*@__PURE__*/
+  messageDesc(file_wskv, 12);
 
 /**
  * @generated from message pb.Put
@@ -451,7 +503,7 @@ export type Put = Message<"pb.Put"> & {
  * Use `create(PutSchema)` to create a new message.
  */
 export const PutSchema: GenMessage<Put> = /*@__PURE__*/
-  messageDesc(file_wskv, 12);
+  messageDesc(file_wskv, 13);
 
 /**
  * @generated from message pb.Entry
@@ -480,5 +532,5 @@ export type Entry = Message<"pb.Entry"> & {
  * Use `create(EntrySchema)` to create a new message.
  */
 export const EntrySchema: GenMessage<Entry> = /*@__PURE__*/
-  messageDesc(file_wskv, 13);
+  messageDesc(file_wskv, 14);
 

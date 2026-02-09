@@ -7,13 +7,16 @@
   "types": "src/index.ts",
   "scripts": {
     "check": "tsc --noEmit",
-    "generate": "buf generate"
+    "generate": "buf generate",
+    "test": "vitest run"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8",
     "@cloudflare/workers-types": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3"
   }
 }

@@ -27,7 +27,15 @@ export interface CommitResult {
   error: string;
 }
 
-export interface ObservedEntry {
+export interface ReadRangeEntry {
+  start: Uint8Array;
+  end: Uint8Array;
+  entries: ReadEntryItem[];
+  keysOnly: boolean;
+  limit: number;
+}
+
+export interface ReadEntryItem {
   key: Uint8Array;
   ver: number;
 }
@@ -83,10 +91,10 @@ export function dbList(storage: Storage, opts: ListOptions): ListEntry[] {
   }));
 }
 
-/** Atomically commit puts and deletes with OCC version checks. */
+/** Atomically commit puts and deletes with range-based OCC validation. */
 export function dbCommit(
   storage: Storage,
-  observed: ObservedEntry[],
+  reads: ReadRangeEntry[],
   puts: PutEntry[],
   dels: Uint8Array[],
 ): CommitResult {
@@ -94,16 +102,34 @@ export function dbCommit(
   let error = "";
 
   storage.transactionSync(() => {
-    // Check observed versions (OCC)
-    for (const obs of observed) {
-      const rows = storage.sql
-        .exec<{ ver: number }>("SELECT ver FROM jfs_kv WHERE k = ?", obs.key)
+    // Validate read ranges: re-scan each range and verify entry set matches
+    for (const rng of reads) {
+      let query = "SELECT k, ver FROM jfs_kv WHERE k >= ? AND k < ? ORDER BY k";
+      const bindings: unknown[] = [rng.start, rng.end];
+      if (rng.limit > 0) {
+        query += " LIMIT ?";
+        bindings.push(rng.limit);
+      }
+      const currentRows = storage.sql
+        .exec<{ k: ArrayBuffer; ver: number }>(query, ...bindings)
         .toArray();
-      const curVer = rows.length > 0 ? rows[0].ver : 0;
-      if (curVer !== obs.ver) {
+
+      if (currentRows.length !== rng.entries.length) {
         ok = false;
         error = "write conflict";
         return;
+      }
+      for (let i = 0; i < currentRows.length; i++) {
+        if (!bytesEqual(new Uint8Array(currentRows[i].k), rng.entries[i].key)) {
+          ok = false;
+          error = "write conflict";
+          return;
+        }
+        if (!rng.keysOnly && currentRows[i].ver !== rng.entries[i].ver) {
+          ok = false;
+          error = "write conflict";
+          return;
+        }
       }
     }
 
@@ -124,6 +150,14 @@ export function dbCommit(
   });
 
   return { ok, error };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /** Delete all rows from the kv table. */
