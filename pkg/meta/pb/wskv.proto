@@ -1,0 +1,155 @@
+syntax = "proto3";
+package pb;
+option go_package = "./pb";
+
+/*
+Generate:
+  protoc --go_out=pkg/meta pkg/meta/pb/wskv.proto
+from the repo root.
+
+WebSocket KV protocol for proxying JuiceFS TKV operations between
+a Cloudflare sandbox container (Go) and a Durable Object (TypeScript).
+
+Keys are raw binary (not hex-encoded — protobuf handles bytes natively).
+Transactions use optimistic concurrency control (OCC):
+  1. Reads record key+version
+  2. Writes buffer locally
+  3. Commit verifies versions then applies atomically via transactionSync()
+*/
+
+// ─── Requests (Container → DO) ───
+
+// GetRequest fetches a single key's value and version from the store.
+// The server looks up the key and returns its current value and OCC version.
+// If the key does not exist, the response has found=false and ver=0.
+// Within a transaction, the returned version is recorded so the commit
+// can detect concurrent modifications.
+message GetRequest {
+  uint64 id = 1;
+  bytes key = 2;
+}
+
+// ListRequest performs a sorted range scan over keys in [start, end).
+// The server returns all matching entries ordered by key (binary sort order).
+// If keys_only is true, entry values are omitted (useful for existence checks).
+// If limit > 0, at most that many entries are returned.
+// Within a transaction, the version of every returned entry is recorded
+// for OCC conflict detection at commit time.
+message ListRequest {
+  uint64 id = 1;
+  bytes start = 2;     // inclusive lower bound
+  bytes end = 3;       // exclusive upper bound
+  bool keys_only = 4;
+  uint32 limit = 5;    // 0 = no limit
+}
+
+// CommitRequest atomically applies a set of writes after verifying that
+// no observed keys have been modified since they were read.
+//
+// The server executes this inside a single synchronous transaction:
+//   1. For each entry in observed: verify the key's current version matches.
+//      If any version differs (or a key was created/deleted), the commit
+//      fails with "write conflict" and no changes are applied.
+//   2. For each entry in puts: upsert the key with the new value and
+//      increment its version.
+//   3. For each key in dels: delete the key from the store.
+//
+// On conflict, the client retries the entire transaction (read + commit).
+// JuiceFS has built-in retry logic for this.
+message CommitRequest {
+  uint64 id = 1;
+  repeated Observed observed = 2;
+  repeated Put puts = 3;
+  repeated bytes dels = 4;
+}
+
+// ResetRequest deletes all keys from the store. Used during volume
+// initialization and testing. This is not transactional — it
+// unconditionally wipes the entire store.
+message ResetRequest {
+  uint64 id = 1;
+}
+
+// ─── Control messages ───
+
+// InitNotification is sent by the Durable Object to the container after
+// the WebSocket connects. It provides the object storage credentials and
+// volume name needed to mount JuiceFS.
+message InitNotification {
+  string storage = 1;
+  string bucket = 2;
+  string access_key = 3;
+  string secret_key = 4;
+  string volume_name = 5;
+}
+
+// ReadyNotification is sent by the container back to the Durable Object
+// after JuiceFS has been successfully mounted and is ready to serve.
+message ReadyNotification {}
+
+// ─── Responses (DO → Container) ───
+
+message GetResponse {
+  uint64 id = 1;
+  bytes value = 2;    // empty if key not found
+  uint32 ver = 3;     // 0 if key not found
+  bool found = 4;
+}
+
+message ListResponse {
+  uint64 id = 1;
+  repeated Entry entries = 2;
+}
+
+message CommitResponse {
+  uint64 id = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+message ResetResponse {
+  uint64 id = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+// ─── Envelope ───
+// Each WebSocket binary frame contains exactly one WskvMessage.
+
+message WskvMessage {
+  oneof msg {
+    // requests
+    GetRequest get_req = 1;
+    ListRequest list_req = 2;
+    CommitRequest commit_req = 3;
+    ResetRequest reset_req = 4;
+
+    // responses
+    GetResponse get_resp = 10;
+    ListResponse list_resp = 11;
+    CommitResponse commit_resp = 12;
+    ResetResponse reset_resp = 13;
+
+    // control
+    InitNotification init_notify = 20;
+    ReadyNotification ready_notify = 21;
+  }
+}
+
+// ─── Shared types ───
+
+message Observed {
+  bytes key = 1;
+  uint32 ver = 2;
+}
+
+message Put {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message Entry {
+  bytes key = 1;
+  bytes value = 2;  // empty when keys_only
+  uint32 ver = 3;
+}

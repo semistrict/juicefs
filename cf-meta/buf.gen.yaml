@@ -1,0 +1,8 @@
+version: v2
+inputs:
+  - directory: ../pkg/meta/pb
+plugins:
+  - local: protoc-gen-es
+    out: packages/wskv-server/src/gen
+    opt:
+      - target=ts
