@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import type { GenMessage } from "@bufbuild/protobuf/codegenv2";
 import {
   type WskvMessage,
   WskvMessageSchema,
@@ -12,38 +13,9 @@ import {
   ResetResponseSchema,
   EntrySchema,
 } from "./gen/wskv_pb.js";
-
-/**
- * Minimal interface for DO SQLite storage.
- * Matches DurableObjectStorage.sql from @cloudflare/workers-types.
- */
-export interface SqlStorage {
-  exec<T extends Record<string, SqlStorageValue>>(
-    query: string,
-    ...bindings: unknown[]
-  ): SqlStorageCursor<T>;
-}
-
-export interface SqlStorageCursor<T> {
-  toArray(): T[];
-}
-
-export type SqlStorageValue =
-  | ArrayBuffer
-  | string
-  | number
-  | null;
-
-export interface Storage {
-  sql: SqlStorage;
-  transactionSync: (fn: () => void) => void;
-}
-
-const INIT_SQL = `CREATE TABLE IF NOT EXISTS jfs_kv (
-  k BLOB PRIMARY KEY,
-  v BLOB NOT NULL,
-  ver INTEGER NOT NULL DEFAULT 1
-) WITHOUT ROWID`;
+import type { Storage } from "./schema.js";
+import { ensureTable } from "./schema.js";
+import { dbGet, dbList, dbCommit, dbReset } from "./db.js";
 
 export class WskvServer {
   private storage: Storage;
@@ -51,12 +23,6 @@ export class WskvServer {
 
   constructor(storage: Storage) {
     this.storage = storage;
-  }
-
-  private ensureTable(): void {
-    if (this.initialized) return;
-    this.storage.sql.exec(INIT_SQL);
-    this.initialized = true;
   }
 
   /**
@@ -68,9 +34,20 @@ export class WskvServer {
     if (msg.msg.case === "readyNotify") {
       return null;
     }
-    this.ensureTable();
+    if (!this.initialized) {
+      ensureTable(this.storage);
+      this.initialized = true;
+    }
     const resp = this.dispatch(msg);
     return toBinary(WskvMessageSchema, resp).buffer as ArrayBuffer;
+  }
+
+  /** Create a proto message and wrap it in the WskvMessage envelope. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private wrap(case_: WskvMessage["msg"]["case"], schema: GenMessage<any>, fields: object): WskvMessage {
+    return create(WskvMessageSchema, {
+      msg: { case: case_, value: create(schema, fields) } as WskvMessage["msg"],
+    });
   }
 
   private dispatch(msg: WskvMessage): WskvMessage {
@@ -89,104 +66,59 @@ export class WskvServer {
   }
 
   private handleGet(req: GetRequest): WskvMessage {
-    const rows = this.storage.sql
-      .exec<{ v: ArrayBuffer; ver: number }>(
-        "SELECT v, ver FROM jfs_kv WHERE k = ?",
-        req.key,
-      )
-      .toArray();
-
-    const resp = create(GetResponseSchema);
-    resp.id = req.id;
-    if (rows.length > 0) {
-      resp.value = new Uint8Array(rows[0].v);
-      resp.ver = rows[0].ver;
-      resp.found = true;
-    }
-    return create(WskvMessageSchema, { msg: { case: "getResp", value: resp } });
+    const result = dbGet(this.storage, req.key);
+    return this.wrap("getResp", GetResponseSchema, {
+      id: req.id,
+      ...(result.found
+        ? { value: result.value!, ver: result.ver, found: true }
+        : {}),
+    });
   }
 
   private handleList(req: ListRequest): WskvMessage {
-    let query: string;
-    const bindings: unknown[] = [req.start, req.end];
-
-    if (req.keysOnly) {
-      query = "SELECT k, ver FROM jfs_kv WHERE k >= ? AND k < ? ORDER BY k";
-    } else {
-      query = "SELECT k, v, ver FROM jfs_kv WHERE k >= ? AND k < ? ORDER BY k";
-    }
-
-    if (req.limit > 0) {
-      query += " LIMIT ?";
-      bindings.push(req.limit);
-    }
-
-    const rows = this.storage.sql
-      .exec<{ k: ArrayBuffer; v: ArrayBuffer | null; ver: number }>(query, ...bindings)
-      .toArray();
-
-    const entries = rows.map((row) => {
-      const entry = create(EntrySchema);
-      entry.key = new Uint8Array(row.k);
-      entry.ver = row.ver;
-      if (!req.keysOnly && row.v != null) {
-        entry.value = new Uint8Array(row.v);
-      }
-      return entry;
+    const rows = dbList(this.storage, {
+      start: req.start,
+      end: req.end,
+      keysOnly: req.keysOnly,
+      limit: req.limit,
     });
-
-    const resp = create(ListResponseSchema);
-    resp.id = req.id;
-    resp.entries = entries;
-    return create(WskvMessageSchema, { msg: { case: "listResp", value: resp } });
+    return this.wrap("listResp", ListResponseSchema, {
+      id: req.id,
+      entries: rows.map((row) =>
+        create(EntrySchema, {
+          key: row.key,
+          ver: row.ver,
+          ...(row.value != null ? { value: row.value } : {}),
+        }),
+      ),
+    });
   }
 
   private handleCommit(req: CommitRequest): WskvMessage {
-    let ok = true;
-    let error = "";
-
-    this.storage.transactionSync(() => {
-      // Check observed versions (OCC)
-      for (const obs of req.observed) {
-        const rows = this.storage.sql
-          .exec<{ ver: number }>("SELECT ver FROM jfs_kv WHERE k = ?", obs.key)
-          .toArray();
-        const curVer = rows.length > 0 ? rows[0].ver : 0;
-        if (curVer !== obs.ver) {
-          ok = false;
-          error = "write conflict";
-          return;
-        }
-      }
-
-      // Apply puts
-      for (const put of req.puts) {
-        this.storage.sql.exec(
-          `INSERT INTO jfs_kv (k, v, ver) VALUES (?, ?, 1)
-           ON CONFLICT(k) DO UPDATE SET v = excluded.v, ver = ver + 1`,
-          put.key,
-          put.value,
-        );
-      }
-
-      // Apply deletes
-      for (const del of req.dels) {
-        this.storage.sql.exec("DELETE FROM jfs_kv WHERE k = ?", del);
-      }
+    const result = dbCommit(
+      this.storage,
+      req.reads.map((rng) => ({
+        start: rng.start,
+        end: rng.end,
+        entries: rng.entries.map((e) => ({ key: e.key, ver: e.ver })),
+        keysOnly: rng.keysOnly,
+        limit: rng.limit,
+      })),
+      req.puts.map((put) => ({ key: put.key, value: put.value })),
+      req.dels,
+    );
+    return this.wrap("commitResp", CommitResponseSchema, {
+      id: req.id,
+      ok: result.ok,
+      error: result.error,
     });
-
-    const resp = create(CommitResponseSchema);
-    resp.id = req.id;
-    resp.ok = ok;
-    resp.error = error;
-    return create(WskvMessageSchema, { msg: { case: "commitResp", value: resp } });
   }
 
   private handleReset(req: ResetRequest): WskvMessage {
-    this.storage.sql.exec("DELETE FROM jfs_kv");
-    const resp = create(ResetResponseSchema);
-    resp.id = req.id;
-    resp.ok = true;
-    return create(WskvMessageSchema, { msg: { case: "resetResp", value: resp } });
+    dbReset(this.storage);
+    return this.wrap("resetResp", ResetResponseSchema, {
+      id: req.id,
+      ok: true,
+    });
   }
 }

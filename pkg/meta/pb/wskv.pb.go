@@ -161,12 +161,12 @@ func (x *ListRequest) GetLimit() uint32 {
 }
 
 // CommitRequest atomically applies a set of writes after verifying that
-// no observed keys have been modified since they were read.
+// no read ranges have been modified since they were read.
 //
 // The server executes this inside a single synchronous transaction:
-//  1. For each entry in observed: verify the key's current version matches.
-//     If any version differs (or a key was created/deleted), the commit
-//     fails with "write conflict" and no changes are applied.
+//  1. For each ReadRange in reads: re-scan [start, end) and verify that
+//     the current set of (key, version) pairs matches exactly. If any key
+//     was added, removed, or modified, the commit fails with "write conflict".
 //  2. For each entry in puts: upsert the key with the new value and
 //     increment its version.
 //  3. For each key in dels: delete the key from the store.
@@ -176,7 +176,7 @@ func (x *ListRequest) GetLimit() uint32 {
 type CommitRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            uint64                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	Observed      []*Observed            `protobuf:"bytes,2,rep,name=observed,proto3" json:"observed,omitempty"`
+	Reads         []*ReadRange           `protobuf:"bytes,2,rep,name=reads,proto3" json:"reads,omitempty"`
 	Puts          []*Put                 `protobuf:"bytes,3,rep,name=puts,proto3" json:"puts,omitempty"`
 	Dels          [][]byte               `protobuf:"bytes,4,rep,name=dels,proto3" json:"dels,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -220,9 +220,9 @@ func (x *CommitRequest) GetId() uint64 {
 	return 0
 }
 
-func (x *CommitRequest) GetObserved() []*Observed {
+func (x *CommitRequest) GetReads() []*ReadRange {
 	if x != nil {
-		return x.Observed
+		return x.Reads
 	}
 	return nil
 }
@@ -858,28 +858,35 @@ func (*WskvMessage_InitNotify) isWskvMessage_Msg() {}
 
 func (*WskvMessage_ReadyNotify) isWskvMessage_Msg() {}
 
-type Observed struct {
+// ReadRange captures a range [start, end) that was read during a transaction,
+// along with the exact set of (key, version) entries found at read time.
+// At commit, the server re-scans each range and verifies the entries match.
+// A point get(key) is represented as [key, nextKey(key)) with 0 or 1 entry.
+type ReadRange struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Ver           uint32                 `protobuf:"varint,2,opt,name=ver,proto3" json:"ver,omitempty"`
+	Start         []byte                 `protobuf:"bytes,1,opt,name=start,proto3" json:"start,omitempty"`                        // inclusive
+	End           []byte                 `protobuf:"bytes,2,opt,name=end,proto3" json:"end,omitempty"`                            // exclusive
+	Entries       []*ReadEntry           `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`                    // sorted entries found at read time
+	KeysOnly      bool                   `protobuf:"varint,4,opt,name=keys_only,json=keysOnly,proto3" json:"keys_only,omitempty"` // when true, only check key presence, ignore version changes
+	Limit         uint32                 `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`                       // 0 = no limit; mirrors the limit used at read time
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *Observed) Reset() {
-	*x = Observed{}
+func (x *ReadRange) Reset() {
+	*x = ReadRange{}
 	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *Observed) String() string {
+func (x *ReadRange) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*Observed) ProtoMessage() {}
+func (*ReadRange) ProtoMessage() {}
 
-func (x *Observed) ProtoReflect() protoreflect.Message {
+func (x *ReadRange) ProtoReflect() protoreflect.Message {
 	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -891,19 +898,92 @@ func (x *Observed) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use Observed.ProtoReflect.Descriptor instead.
-func (*Observed) Descriptor() ([]byte, []int) {
+// Deprecated: Use ReadRange.ProtoReflect.Descriptor instead.
+func (*ReadRange) Descriptor() ([]byte, []int) {
 	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{11}
 }
 
-func (x *Observed) GetKey() []byte {
+func (x *ReadRange) GetStart() []byte {
+	if x != nil {
+		return x.Start
+	}
+	return nil
+}
+
+func (x *ReadRange) GetEnd() []byte {
+	if x != nil {
+		return x.End
+	}
+	return nil
+}
+
+func (x *ReadRange) GetEntries() []*ReadEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+func (x *ReadRange) GetKeysOnly() bool {
+	if x != nil {
+		return x.KeysOnly
+	}
+	return false
+}
+
+func (x *ReadRange) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type ReadEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Ver           uint32                 `protobuf:"varint,2,opt,name=ver,proto3" json:"ver,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadEntry) Reset() {
+	*x = ReadEntry{}
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadEntry) ProtoMessage() {}
+
+func (x *ReadEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadEntry.ProtoReflect.Descriptor instead.
+func (*ReadEntry) Descriptor() ([]byte, []int) {
+	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *ReadEntry) GetKey() []byte {
 	if x != nil {
 		return x.Key
 	}
 	return nil
 }
 
-func (x *Observed) GetVer() uint32 {
+func (x *ReadEntry) GetVer() uint32 {
 	if x != nil {
 		return x.Ver
 	}
@@ -920,7 +1000,7 @@ type Put struct {
 
 func (x *Put) Reset() {
 	*x = Put{}
-	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[12]
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -932,7 +1012,7 @@ func (x *Put) String() string {
 func (*Put) ProtoMessage() {}
 
 func (x *Put) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[12]
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -945,7 +1025,7 @@ func (x *Put) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Put.ProtoReflect.Descriptor instead.
 func (*Put) Descriptor() ([]byte, []int) {
-	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{12}
+	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Put) GetKey() []byte {
@@ -973,7 +1053,7 @@ type Entry struct {
 
 func (x *Entry) Reset() {
 	*x = Entry{}
-	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[13]
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -985,7 +1065,7 @@ func (x *Entry) String() string {
 func (*Entry) ProtoMessage() {}
 
 func (x *Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[13]
+	mi := &file_pkg_meta_pb_wskv_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -998,7 +1078,7 @@ func (x *Entry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Entry.ProtoReflect.Descriptor instead.
 func (*Entry) Descriptor() ([]byte, []int) {
-	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{13}
+	return file_pkg_meta_pb_wskv_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Entry) GetKey() []byte {
@@ -1036,10 +1116,10 @@ const file_pkg_meta_pb_wskv_proto_rawDesc = "" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +
 	"\x03end\x18\x03 \x01(\fR\x03end\x12\x1b\n" +
 	"\tkeys_only\x18\x04 \x01(\bR\bkeysOnly\x12\x14\n" +
-	"\x05limit\x18\x05 \x01(\rR\x05limit\"z\n" +
+	"\x05limit\x18\x05 \x01(\rR\x05limit\"u\n" +
 	"\rCommitRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x04R\x02id\x12(\n" +
-	"\bobserved\x18\x02 \x03(\v2\f.pb.ObservedR\bobserved\x12\x1b\n" +
+	"\x02id\x18\x01 \x01(\x04R\x02id\x12#\n" +
+	"\x05reads\x18\x02 \x03(\v2\r.pb.ReadRangeR\x05reads\x12\x1b\n" +
 	"\x04puts\x18\x03 \x03(\v2\a.pb.PutR\x04puts\x12\x12\n" +
 	"\x04dels\x18\x04 \x03(\fR\x04dels\"\x1e\n" +
 	"\fResetRequest\x12\x0e\n" +
@@ -1086,8 +1166,14 @@ const file_pkg_meta_pb_wskv_proto_rawDesc = "" +
 	"\vinit_notify\x18\x14 \x01(\v2\x14.pb.InitNotificationH\x00R\n" +
 	"initNotify\x12:\n" +
 	"\fready_notify\x18\x15 \x01(\v2\x15.pb.ReadyNotificationH\x00R\vreadyNotifyB\x05\n" +
-	"\x03msg\".\n" +
-	"\bObserved\x12\x10\n" +
+	"\x03msg\"\x8f\x01\n" +
+	"\tReadRange\x12\x14\n" +
+	"\x05start\x18\x01 \x01(\fR\x05start\x12\x10\n" +
+	"\x03end\x18\x02 \x01(\fR\x03end\x12'\n" +
+	"\aentries\x18\x03 \x03(\v2\r.pb.ReadEntryR\aentries\x12\x1b\n" +
+	"\tkeys_only\x18\x04 \x01(\bR\bkeysOnly\x12\x14\n" +
+	"\x05limit\x18\x05 \x01(\rR\x05limit\"/\n" +
+	"\tReadEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x10\n" +
 	"\x03ver\x18\x02 \x01(\rR\x03ver\"-\n" +
 	"\x03Put\x12\x10\n" +
@@ -1110,7 +1196,7 @@ func file_pkg_meta_pb_wskv_proto_rawDescGZIP() []byte {
 	return file_pkg_meta_pb_wskv_proto_rawDescData
 }
 
-var file_pkg_meta_pb_wskv_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_pkg_meta_pb_wskv_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_pkg_meta_pb_wskv_proto_goTypes = []any{
 	(*GetRequest)(nil),        // 0: pb.GetRequest
 	(*ListRequest)(nil),       // 1: pb.ListRequest
@@ -1123,14 +1209,15 @@ var file_pkg_meta_pb_wskv_proto_goTypes = []any{
 	(*CommitResponse)(nil),    // 8: pb.CommitResponse
 	(*ResetResponse)(nil),     // 9: pb.ResetResponse
 	(*WskvMessage)(nil),       // 10: pb.WskvMessage
-	(*Observed)(nil),          // 11: pb.Observed
-	(*Put)(nil),               // 12: pb.Put
-	(*Entry)(nil),             // 13: pb.Entry
+	(*ReadRange)(nil),         // 11: pb.ReadRange
+	(*ReadEntry)(nil),         // 12: pb.ReadEntry
+	(*Put)(nil),               // 13: pb.Put
+	(*Entry)(nil),             // 14: pb.Entry
 }
 var file_pkg_meta_pb_wskv_proto_depIdxs = []int32{
-	11, // 0: pb.CommitRequest.observed:type_name -> pb.Observed
-	12, // 1: pb.CommitRequest.puts:type_name -> pb.Put
-	13, // 2: pb.ListResponse.entries:type_name -> pb.Entry
+	11, // 0: pb.CommitRequest.reads:type_name -> pb.ReadRange
+	13, // 1: pb.CommitRequest.puts:type_name -> pb.Put
+	14, // 2: pb.ListResponse.entries:type_name -> pb.Entry
 	0,  // 3: pb.WskvMessage.get_req:type_name -> pb.GetRequest
 	1,  // 4: pb.WskvMessage.list_req:type_name -> pb.ListRequest
 	2,  // 5: pb.WskvMessage.commit_req:type_name -> pb.CommitRequest
@@ -1141,11 +1228,12 @@ var file_pkg_meta_pb_wskv_proto_depIdxs = []int32{
 	9,  // 10: pb.WskvMessage.reset_resp:type_name -> pb.ResetResponse
 	4,  // 11: pb.WskvMessage.init_notify:type_name -> pb.InitNotification
 	5,  // 12: pb.WskvMessage.ready_notify:type_name -> pb.ReadyNotification
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	12, // 13: pb.ReadRange.entries:type_name -> pb.ReadEntry
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_pkg_meta_pb_wskv_proto_init() }
@@ -1171,7 +1259,7 @@ func file_pkg_meta_pb_wskv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_meta_pb_wskv_proto_rawDesc), len(file_pkg_meta_pb_wskv_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

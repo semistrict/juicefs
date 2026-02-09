@@ -139,19 +139,36 @@ func (s *WskvServer) handleCommit(req *pb.CommitRequest) *pb.WskvMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check observed versions (OCC)
-	for _, obs := range req.Observed {
-		entry := s.store[string(obs.Key)]
-		var curVer uint32
-		if entry != nil {
-			curVer = entry.ver
+	// Validate read ranges (OCC): re-scan each range and verify the entry set matches
+	for _, rng := range req.Reads {
+		start := string(rng.Start)
+		end := string(rng.End)
+		currentKeys := sortedKeys(s.store, start, end)
+		if rng.Limit > 0 && uint32(len(currentKeys)) > rng.Limit {
+			currentKeys = currentKeys[:rng.Limit]
 		}
-		if curVer != obs.Ver {
+		if len(currentKeys) != len(rng.Entries) {
 			return &pb.WskvMessage{Msg: &pb.WskvMessage_CommitResp{CommitResp: &pb.CommitResponse{
 				Id:    req.Id,
 				Ok:    false,
 				Error: "write conflict",
 			}}}
+		}
+		for i, k := range currentKeys {
+			if k != string(rng.Entries[i].Key) {
+				return &pb.WskvMessage{Msg: &pb.WskvMessage_CommitResp{CommitResp: &pb.CommitResponse{
+					Id:    req.Id,
+					Ok:    false,
+					Error: "write conflict",
+				}}}
+			}
+			if !rng.KeysOnly && s.store[k].ver != rng.Entries[i].Ver {
+				return &pb.WskvMessage{Msg: &pb.WskvMessage_CommitResp{CommitResp: &pb.CommitResponse{
+					Id:    req.Id,
+					Ok:    false,
+					Error: "write conflict",
+				}}}
+			}
 		}
 	}
 

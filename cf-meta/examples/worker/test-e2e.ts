@@ -13,7 +13,11 @@
  *   WSKV_URL=http://localhost:8787 pnpm test:e2e  # run against local wrangler dev
  */
 
-const BASE = process.env.WSKV_URL ?? "https://wskv-example.ramon3525.workers.dev";
+const BASE = process.env.WSKV_URL;
+if (!BASE) {
+  console.error("WSKV_URL environment variable is required");
+  process.exit(1);
+}
 const NAME = "test";
 
 async function main() {
@@ -124,8 +128,9 @@ async function waitForMount(): Promise<string> {
   console.log("/dev/fuse:", fuse.stdout);
 
   throw new Error(
-    "FUSE mount not active at /mnt/jfs after 60s. " +
-    "The WebSocket connection or FUSE setup may have failed."
+    "FUSE mount not active at /mnt/jfs after 60s.\n" +
+    `cfmount logs: ${logs.stdout}\n` +
+    `/dev/fuse: ${fuse.stdout}`
   );
 }
 
@@ -133,7 +138,4 @@ function assert(cond: boolean, msg: string) {
   if (!cond) throw new Error(`Assertion failed: ${msg}`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+await main();

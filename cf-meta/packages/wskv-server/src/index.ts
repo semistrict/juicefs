@@ -1,29 +1,40 @@
-import { create, toBinary } from "@bufbuild/protobuf";
 import { WskvServer } from "./wskv-server.js";
-import type { Storage } from "./wskv-server.js";
-import { WskvMessageSchema, InitNotificationSchema } from "./gen/wskv_pb.js";
+import type { Storage } from "./schema.js";
+import { WsKvClient } from "./ws-client.js";
 
-export { WskvServer };
-export type { Storage, SqlStorage, SqlStorageCursor, SqlStorageValue } from "./wskv-server.js";
+export { WskvServer, WsKvClient };
+export type { Storage, SqlStorage, SqlStorageCursor, SqlStorageValue } from "./schema.js";
 
 export interface StorageConfig {
   storage: string;
   bucket: string;
+  /** Optional path prefix within the bucket (e.g. "subdir/foo"). */
+  bucketPath?: string;
   accessKey: string;
   secretKey: string;
   volumeName: string;
 }
 
+/** Minimal subset of the Sandbox Process handle we depend on. */
+export interface ContainerProcess {
+  readonly id: string;
+  readonly status: string;
+  kill(signal?: string): Promise<void>;
+  getStatus(): Promise<string>;
+  getLogs(): Promise<{ stdout: string; stderr: string }>;
+  waitForPort(port: number, options?: { mode?: "http" | "tcp"; timeout?: number }): Promise<void>;
+}
+
 /** Methods we need from the Container/Sandbox DO. */
 export interface ContainerHandle {
   exec(cmd: string): Promise<unknown>;
-  waitForPort(opts: { portToCheck: number; retries: number; waitInterval: number }): Promise<unknown>;
+  startProcess(cmd: string, opts?: { processId?: string }): Promise<ContainerProcess>;
   containerFetch(request: Request, port: number): Promise<Response>;
 }
 
 export interface StartWskvOptions {
   storage: Storage;
-  mountpoint?: string;
+  mountpoint: string;
   port?: number;
   config: StorageConfig;
 }
@@ -31,15 +42,23 @@ export interface StartWskvOptions {
 /**
  * Manages the JuiceFS cfmount lifecycle inside a Cloudflare Container.
  *
- * Call `launch()` from onStart() to start the Go binary (fast, safe for
- * blockConcurrencyWhile), then call `connect()` from fetch() or elsewhere
+ * Call `start()` from onStart() to start the Go binary as a managed
+ * background process, then call `connect()` from fetch() or elsewhere
  * to establish the WebSocket and wire up wskv.
+ *
+ * If the WebSocket closes unexpectedly, the mount will automatically
+ * reconnect with exponential backoff (1s, 2s, 4s, 8s, capped at 10s).
+ * Call `close()` to stop reconnection attempts and shut down cleanly.
  */
 export class WskvMount {
   private container: ContainerHandle;
   private opts: StartWskvOptions;
   private ws: WebSocket | null = null;
   private connecting: Promise<WebSocket> | null = null;
+  private process: ContainerProcess | null = null;
+  private closed = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
 
   constructor(container: ContainerHandle, opts: StartWskvOptions) {
     this.container = container;
@@ -47,20 +66,26 @@ export class WskvMount {
   }
 
   get mountpoint(): string {
-    return this.opts.mountpoint ?? "/mnt/jfs";
+    return this.opts.mountpoint;
   }
 
   get port(): number {
-    return this.opts.port ?? 9876;
+    return this.opts.port ?? 14234;
   }
 
-  /** Start the Go binary in the background. Safe to call from onStart(). */
-  launch(): void {
-    this.container.exec(
-      `juicefs-cfmount ${this.mountpoint} --port ${this.port} > /tmp/cfmount.log 2>&1 &`,
-    ).catch((err) => {
-      console.error("cfmount background start failed:", err);
+  /**
+   * Start the cfmount binary as a managed background process.
+   *
+   * Uses the container's `startProcess()` API so the process is tracked,
+   * its logs are captured, and it can be inspected or killed later.
+   * Safe to call from onStart().
+   */
+  async start(): Promise<void> {
+    const cmd = `juicefs-cfmount ${this.mountpoint} --address 0.0.0.0:${this.port}`;
+    this.process = await this.container.startProcess(cmd, {
+      processId: "cfmount",
     });
+    console.log(`cfmount process started (id=${this.process.id})`);
   }
 
   /** Wait for the binary, upgrade to WebSocket, wire up wskv. Idempotent. */
@@ -76,13 +101,59 @@ export class WskvMount {
     }
   }
 
+  /**
+   * Stop reconnection attempts and close the current WebSocket.
+   * After calling close(), the mount will not attempt to reconnect.
+   */
+  close(): void {
+    this.closed = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  /** Return the managed process handle, if started. */
+  getProcess(): ContainerProcess | null {
+    return this.process;
+  }
+
+  /** Calculate backoff delay: 1s, 2s, 4s, 8s, capped at 10s. */
+  private getBackoffMs(): number {
+    const base = 1000;
+    const delay = base * Math.pow(2, this.reconnectAttempt);
+    return Math.min(delay, 10_000);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed) return;
+    const delay = this.getBackoffMs();
+    this.reconnectAttempt++;
+    console.log(`WebSocket closed, reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed) return;
+      // Trigger reconnect; connect() is idempotent and handles the connecting state.
+      this.connect().catch((err) => {
+        console.error(`Reconnect attempt ${this.reconnectAttempt} failed: ${err}`);
+        // Schedule another attempt on failure.
+        this.scheduleReconnect();
+      });
+    }, delay);
+  }
+
   private async doConnect(): Promise<WebSocket> {
-    // 1. Wait for the Go binary's HTTP server.
-    await this.container.waitForPort({
-      portToCheck: this.port,
-      retries: 30,
-      waitInterval: 1000,
-    });
+    // 1. Wait for the Go binary's HTTP server via the managed process handle.
+    if (this.process) {
+      await this.process.waitForPort(this.port, { mode: "tcp", timeout: 30_000 });
+    } else {
+      // Fallback: binary was started outside our control.
+      throw new Error("cfmount process not started — call start() first");
+    }
 
     // 2. Upgrade to WebSocket.
     const resp = await this.container.containerFetch(
@@ -97,30 +168,20 @@ export class WskvMount {
     }
     ws.accept();
 
-    // 3. Send init_notify with storage credentials.
-    const initNotify = create(InitNotificationSchema, {
-      storage: this.opts.config.storage,
-      bucket: this.opts.config.bucket,
-      accessKey: this.opts.config.accessKey,
-      secretKey: this.opts.config.secretKey,
-      volumeName: this.opts.config.volumeName,
-    });
-    ws.send(toBinary(WskvMessageSchema, create(WskvMessageSchema, {
-      msg: { case: "initNotify", value: initNotify },
-    })));
+    // 3. Wire up protocol client.
+    const client = new WsKvClient(ws);
+    client.sendInit(this.opts.config);
 
     // 4. Wire up wskv message handling.
     const server = new WskvServer(this.opts.storage);
-    ws.addEventListener("message", (event) => {
-      const data = event.data;
-      if (typeof data === "string") return;
-      const resp = server.handleMessage(data as ArrayBuffer);
-      if (resp) ws.send(resp);
+    client.onMessage((data) => server.handleMessage(data));
+    client.onClose(() => {
+      this.ws = null;
+      this.scheduleReconnect();
     });
 
-    ws.addEventListener("close", () => {
-      this.ws = null;
-    });
+    // Connection succeeded; reset backoff counter.
+    this.reconnectAttempt = 0;
 
     return ws;
   }

@@ -83,7 +83,10 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test
+cfmount: cmd/cfmount/*.go pkg/*/*.go go.*
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags nocompress,nosqlite,nomysql,nopg,notikv,nobadger,noetcd -o juicefs-cfmount ./cmd/cfmount
+
+.PHONY: snapshot release debug test cfmount
 snapshot:
 	docker run --rm --privileged \
 		-e REVISIONDATE=$(REVISIONDATE) \
@@ -119,6 +122,22 @@ test.pkg:
 
 test.cmd:
 	sudo JFS_GC_SKIPPEDTIME=1 MINIO_ACCESS_KEY=testUser MINIO_SECRET_KEY=testUserPassword GOMAXPROCS=8 go test -v -count=1 -failfast -cover -timeout=8m ./cmd/... -coverpkg=./pkg/...,./cmd/... -args -test.gocoverdir="$(shell realpath cover/)"
+
+# Run Go meta tests (TestWskvTKV + TestWskvMeta) against the TypeScript
+# WskvServer in a Cloudflare Durable Object with real SQLite storage.
+# Starts wrangler dev, kicks the DO to connect back to the Go test's
+# WebSocket listener, then runs the full meta test suite over that link.
+test.wskv-cf:
+	cd cf-meta/packages/wskv-server && pnpm exec wrangler dev --port 8787 & \
+	WRANGLER_PID=$$!; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		curl -s http://localhost:8787 >/dev/null 2>&1 && break; \
+		sleep 0.5; \
+	done; \
+	WSKV_CF_URL=http://localhost:8787 go test -v -run 'TestWskv' -count=1 -failfast -timeout=5m ./pkg/meta/...; \
+	ret=$$?; \
+	kill $$WRANGLER_PID 2>/dev/null; wait $$WRANGLER_PID 2>/dev/null; \
+	exit $$ret
 
 test.fdb:
 	go test -v -cover -count=1  -failfast -timeout=4m ./pkg/meta/ -tags fdb -run=TestFdb -args -test.gocoverdir="$(shell realpath cover/)"

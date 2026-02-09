@@ -1,6 +1,6 @@
 name = "wskv-example"
 main = "src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-02-09"
 compatibility_flags = ["nodejs_compat"]
 
 [[containers]]

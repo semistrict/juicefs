@@ -11,10 +11,12 @@ WebSocket KV protocol for proxying JuiceFS TKV operations between
 a Cloudflare sandbox container (Go) and a Durable Object (TypeScript).
 
 Keys are raw binary (not hex-encoded — protobuf handles bytes natively).
-Transactions use optimistic concurrency control (OCC):
-  1. Reads record key+version
+Transactions use optimistic concurrency control (OCC) with range-based read sets:
+  1. Every read (point get or range scan) records a range [start, end)
+     plus the sorted (key, version) entries found
   2. Writes buffer locally
-  3. Commit verifies versions then applies atomically via transactionSync()
+  3. Commit re-scans each range to verify the entry set still matches,
+     then applies writes atomically via transactionSync()
 */
 
 // ─── Requests (Container → DO) ───
@@ -44,12 +46,12 @@ message ListRequest {
 }
 
 // CommitRequest atomically applies a set of writes after verifying that
-// no observed keys have been modified since they were read.
+// no read ranges have been modified since they were read.
 //
 // The server executes this inside a single synchronous transaction:
-//   1. For each entry in observed: verify the key's current version matches.
-//      If any version differs (or a key was created/deleted), the commit
-//      fails with "write conflict" and no changes are applied.
+//   1. For each ReadRange in reads: re-scan [start, end) and verify that
+//      the current set of (key, version) pairs matches exactly. If any key
+//      was added, removed, or modified, the commit fails with "write conflict".
 //   2. For each entry in puts: upsert the key with the new value and
 //      increment its version.
 //   3. For each key in dels: delete the key from the store.
@@ -58,7 +60,7 @@ message ListRequest {
 // JuiceFS has built-in retry logic for this.
 message CommitRequest {
   uint64 id = 1;
-  repeated Observed observed = 2;
+  repeated ReadRange reads = 2;
   repeated Put puts = 3;
   repeated bytes dels = 4;
 }
@@ -138,7 +140,19 @@ message WskvMessage {
 
 // ─── Shared types ───
 
-message Observed {
+// ReadRange captures a range [start, end) that was read during a transaction,
+// along with the exact set of (key, version) entries found at read time.
+// At commit, the server re-scans each range and verifies the entries match.
+// A point get(key) is represented as [key, nextKey(key)) with 0 or 1 entry.
+message ReadRange {
+  bytes start = 1;       // inclusive
+  bytes end = 2;         // exclusive
+  repeated ReadEntry entries = 3;  // sorted entries found at read time
+  bool keys_only = 4;    // when true, only check key presence, ignore version changes
+  uint32 limit = 5;      // 0 = no limit; mirrors the limit used at read time
+}
+
+message ReadEntry {
   bytes key = 1;
   uint32 ver = 2;
 }
