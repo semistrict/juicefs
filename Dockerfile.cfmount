@@ -1,0 +1,10 @@
+FROM docker.io/cloudflare/sandbox:0.7.0
+
+COPY juicefs-cfmount /usr/local/bin/juicefs-cfmount
+RUN chmod +x /usr/local/bin/juicefs-cfmount
+
+RUN mkdir -p /mnt/jfs
+
+# Required during local development to access exposed ports
+EXPOSE 8080
+EXPOSE 9876
