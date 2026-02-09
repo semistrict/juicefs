@@ -1,5 +1,5 @@
 {
-  "name": "@cf-meta/wskv-server",
+  "name": "@juicefs/wskv",
   "version": "0.0.1",
   "private": true,
   "type": "module",

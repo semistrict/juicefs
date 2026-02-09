@@ -1,6 +1,6 @@
 {
   "private": true,
-  "name": "cf-meta",
+  "name": "@juicefs/cf-meta",
   "scripts": {
     "check": "pnpm -r run check",
     "generate": "buf generate"

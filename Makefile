@@ -83,7 +83,10 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test
+cfmount: cmd/cfmount/*.go pkg/*/*.go go.*
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags nocompress,nosqlite,nomysql,nopg,notikv,nobadger,noetcd -o juicefs-cfmount ./cmd/cfmount
+
+.PHONY: snapshot release debug test cfmount
 snapshot:
 	docker run --rm --privileged \
 		-e REVISIONDATE=$(REVISIONDATE) \

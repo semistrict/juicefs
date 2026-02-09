@@ -17,12 +17,12 @@ importers:
 
   examples/worker:
     dependencies:
-      '@cf-meta/wskv-server':
-        specifier: workspace:*
-        version: link:../../packages/wskv-server
       '@cloudflare/sandbox':
         specifier: ^0.7.0
         version: 0.7.0
+      '@juicefs/wskv':
+        specifier: workspace:*
+        version: link:../../packages/wskv-server
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^4

@@ -57,15 +57,26 @@ func newWskvClient(addr string) (tkvClient, error) {
 }
 
 // SetWskvConnection stores the WebSocket connection and starts the read loop.
-// Must be called before any meta operations.
+// Safe to call multiple times for WebSocket reconnection; subsequent calls
+// swap the connection and restart the read loop.
 func SetWskvConnection(ws *websocket.Conn) {
 	if globalWskvClient == nil {
 		globalWskvClient = &wskvClient{
 			ready: make(chan struct{}),
 		}
 	}
+	globalWskvClient.wsMu.Lock()
 	globalWskvClient.ws = ws
-	close(globalWskvClient.ready)
+	globalWskvClient.wsMu.Unlock()
+
+	// Signal readiness on first call only.
+	select {
+	case <-globalWskvClient.ready:
+		// Already closed (not first call) — nothing to do.
+	default:
+		close(globalWskvClient.ready)
+	}
+
 	go globalWskvClient.readLoop()
 }
 
