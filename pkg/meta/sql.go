@@ -559,6 +559,55 @@ func (m *dbMeta) Shutdown() error {
 	return m.db.Close()
 }
 
+// lhChunkHash maps slice IDs to their BLAKE3 block hashes for CAS storage.
+type lhChunkHash struct {
+	SliceId uint64 `xorm:"pk 'slice_id'"`
+	Hashes  []byte `xorm:"blob notnull"`
+	Inline  []byte `xorm:"blob null"`
+}
+
+func (m *dbMeta) InitChunkHashTable() error {
+	return m.syncTable(new(lhChunkHash))
+}
+
+func (m *dbMeta) GetChunkHash(sliceId uint64) (hashes []byte, inline []byte, err error) {
+	var row lhChunkHash
+	err = m.roTxn(Background(), func(s *xorm.Session) error {
+		ok, e := s.Where("slice_id = ?", sliceId).Get(&row)
+		if e != nil {
+			return e
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return row.Hashes, row.Inline, nil
+}
+
+func (m *dbMeta) SetChunkHash(sliceId uint64, hashes []byte, inline []byte) error {
+	return m.txn(func(s *xorm.Session) error {
+		n, err := s.Cols("hashes", "inline").Update(&lhChunkHash{Hashes: hashes, Inline: inline}, &lhChunkHash{SliceId: sliceId})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			_, err = s.Insert(&lhChunkHash{SliceId: sliceId, Hashes: hashes, Inline: inline})
+		}
+		return err
+	})
+}
+
+func (m *dbMeta) DeleteChunkHash(sliceId uint64) error {
+	return m.txn(func(s *xorm.Session) error {
+		_, err := s.Delete(&lhChunkHash{SliceId: sliceId})
+		return err
+	})
+}
+
 func (m *dbMeta) Name() string {
 	name := m.db.DriverName()
 	if name == "pgx" {

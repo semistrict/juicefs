@@ -44,4 +44,7 @@ type ChunkStore interface {
 	CheckCache(id uint64, length uint32, handler func(exists bool, loc string, size int)) error
 	UsedMemory() int64
 	UpdateLimit(upload, download int64)
+	// FlushPending waits for all currently pending writeback uploads to
+	// reach the blob store. Items staged after the call are not waited on.
+	FlushPending(ctx context.Context) error
 }

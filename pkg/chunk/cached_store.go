@@ -50,6 +50,7 @@ type pendingItem struct {
 	fpath     string    // full path of local file corresponding to the key
 	ts        time.Time // timestamp when this item is added
 	uploading atomic.Bool
+	done      chan struct{} // closed when this item is removed from pendingKeys
 }
 
 // slice for read and remove
@@ -1086,7 +1087,7 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 	store.pendingMutex.Lock()
 	item := store.pendingKeys[key]
 	if item == nil {
-		item = &pendingItem{key, stagingPath, added, atomic.Bool{}}
+		item = &pendingItem{key: key, fpath: stagingPath, ts: added, done: make(chan struct{})}
 		store.pendingKeys[key] = item
 	}
 	store.pendingMutex.Unlock()
@@ -1107,8 +1108,46 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 
 func (store *cachedStore) removePending(key string) {
 	store.pendingMutex.Lock()
+	item := store.pendingKeys[key]
 	delete(store.pendingKeys, key)
 	store.pendingMutex.Unlock()
+	if item != nil {
+		close(item.done)
+	}
+}
+
+// FlushPending waits until all currently pending writeback uploads have
+// completed (i.e. reached the blob store). Items staged after this call
+// begins are not waited on — this gives fsync semantics.
+func (store *cachedStore) FlushPending(ctx context.Context) error {
+	// Snapshot current pending items.
+	store.pendingMutex.Lock()
+	items := make([]*pendingItem, 0, len(store.pendingKeys))
+	for _, item := range store.pendingKeys {
+		items = append(items, item)
+	}
+	store.pendingMutex.Unlock()
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Force-enqueue any items not already uploading.
+	for _, item := range items {
+		if item.uploading.CompareAndSwap(false, true) {
+			store.pendingCh <- item
+		}
+	}
+
+	// Wait for all snapshot items to complete.
+	for _, item := range items {
+		select {
+		case <-item.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func (store *cachedStore) isPendingValid(key string) bool {
