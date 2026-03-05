@@ -38,8 +38,9 @@ var logger = utils.GetLogger("juicefs")
 
 type fileSystem struct {
 	fuse.RawFileSystem
-	conf *vfs.Config
-	v    *vfs.VFS
+	conf   *vfs.Config
+	v      *vfs.VFS
+	server *fuse.Server
 }
 
 func newFileSystem(conf *vfs.Config, v *vfs.VFS) *fileSystem {
@@ -252,9 +253,9 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	} else {
 		if runtime.GOOS == "darwin" {
-			go fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
+			go fs.server.InodeNotify(uint64(in.NodeId), -1, 0)
 		} else {
-			fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
+			fs.server.InodeNotify(uint64(in.NodeId), -1, 0)
 		}
 	}
 	return 0
@@ -536,6 +537,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 		}
 	}
 
+	imp.server = fssrv
 	fsserv = fssrv
 	fssrv.Serve()
 	return nil
@@ -588,4 +590,37 @@ func Shutdown() bool {
 		return fsserv.Shutdown()
 	}
 	return false
+}
+
+// CreateServer creates a FUSE server for the given VFS without blocking.
+// The caller must call srv.Serve() (which blocks) and srv.Shutdown() to stop it.
+func CreateServer(v *vfs.VFS, options string, xattrs, ioctl bool) (*fuse.Server, error) {
+	if err := syscall.Setpriority(syscall.PRIO_PROCESS, os.Getpid(), -19); err != nil {
+		logger.Warnf("setpriority: %s", err)
+	}
+	err := grantAccess()
+	if err != nil {
+		logger.Debugf("grant access to /dev/fuse: %s", err)
+	}
+	ensureFuseDev()
+
+	conf := v.Conf
+	imp := newFileSystem(conf, v)
+
+	opt := GenFuseOpt(conf, options, 1, !xattrs, !conf.Format.EnableACL, 0)
+
+	fssrv, err := fuse.NewServer(imp, conf.Meta.MountPoint, &opt)
+	if err != nil {
+		return nil, fmt.Errorf("fuse: %s", err)
+	}
+
+	imp.server = fssrv
+
+	if runtime.GOOS == "linux" {
+		v.InvalidateEntry = func(parent Ino, name string) syscall.Errno {
+			return syscall.Errno(fssrv.EntryNotify(uint64(parent), name))
+		}
+	}
+
+	return fssrv, nil
 }
