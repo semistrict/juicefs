@@ -1,0 +1,82 @@
+import { Sandbox, getSandbox } from "@cloudflare/sandbox";
+import { WskvMount } from "@cf-meta/wskv-server";
+
+interface Env {
+  WSKV: DurableObjectNamespace<WskvDurableObject>;
+  CF_ACCOUNT_ID: string;
+  R2_BUCKET: string;
+  R2_ACCESS_KEY_ID: string;
+  R2_SECRET_ACCESS_KEY: string;
+  VOLUME_NAME: string;
+}
+
+export class WskvDurableObject extends Sandbox<Env> {
+  private mount = new WskvMount(this, {
+    storage: this.ctx.storage,
+    config: {
+      storage: "s3",
+      bucket: `https://${this.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com/${this.env.R2_BUCKET}`,
+      accessKey: this.env.R2_ACCESS_KEY_ID,
+      secretKey: this.env.R2_SECRET_ACCESS_KEY,
+      volumeName: this.env.VOLUME_NAME,
+    },
+  });
+
+  override async onStart(): Promise<void> {
+    this.mount.launch();
+  }
+
+  /** RPC method: establish the wskv WebSocket to the Go binary. */
+  async connectMount(): Promise<void> {
+    await this.mount.connect();
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // POST /connect/:name — establish wskv WebSocket to the Go binary
+    if (request.method === "POST") {
+      const connectMatch = url.pathname.match(/^\/connect\/(.+)$/);
+      if (connectMatch) {
+        try {
+          const sandbox = getSandbox(env.WSKV, connectMatch[1]);
+          await sandbox.connectMount();
+          return Response.json({ connected: true });
+        } catch (err: unknown) {
+          console.error("connect failed:", err);
+          const msg = err instanceof Error ? err.message : String(err);
+          return Response.json({ error: msg }, { status: 500 });
+        }
+      }
+    }
+
+    // POST /exec/:name — run a command inside the container
+    // Body: { "cmd": "ls /mnt/jfs" }
+    if (request.method === "POST") {
+      const execMatch = url.pathname.match(/^\/exec\/(.+)$/);
+      if (execMatch) {
+        const sandbox = getSandbox(env.WSKV, execMatch[1]);
+        const body = await request.json() as { cmd: string };
+        const result = await sandbox.exec(body.cmd);
+        return Response.json({
+          stdout: result.stdout,
+          stderr: result.stderr,
+          exitCode: result.exitCode,
+          success: result.success,
+        });
+      }
+    }
+
+    // GET /mount/:name — get container status
+    const mountMatch = url.pathname.match(/^\/mount\/(.+)$/);
+    if (mountMatch) {
+      const sandbox = getSandbox(env.WSKV, mountMatch[1]);
+      const state = await sandbox.getState();
+      return Response.json({ name: mountMatch[1], state });
+    }
+
+    return new Response("endpoints: POST /connect/:name, POST /exec/:name, GET /mount/:name", { status: 404 });
+  },
+};

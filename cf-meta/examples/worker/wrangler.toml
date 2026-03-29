@@ -1,0 +1,18 @@
+name = "wskv-example"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[containers]]
+class_name = "WskvDurableObject"
+image = "../../../Dockerfile.cfmount"
+instance_type = "lite"
+max_instances = 5
+
+[[durable_objects.bindings]]
+name = "WSKV"
+class_name = "WskvDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WskvDurableObject"]

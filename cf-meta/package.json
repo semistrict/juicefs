@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "name": "cf-meta",
+  "scripts": {
+    "check": "pnpm -r run check",
+    "generate": "buf generate"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1.65.0",
+    "@bufbuild/protoc-gen-es": "^2.11.0"
+  }
+}

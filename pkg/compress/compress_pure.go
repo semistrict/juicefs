@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//go:build !nocompress
+//go:build nocompress
 
 package compress
 
@@ -22,12 +22,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/DataDog/zstd"
-	"github.com/hungys/go-lz4"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
 )
-
-// ZSTD_LEVEL compression level used by Zstd
-const ZSTD_LEVEL = 1 // fastest
 
 // Compressor interface to be implemented by a compression algo
 type Compressor interface {
@@ -41,7 +38,7 @@ type Compressor interface {
 func NewCompressor(algr string) Compressor {
 	algr = strings.ToLower(algr)
 	if algr == "zstd" {
-		return ZStandard{ZSTD_LEVEL}
+		return ZStandard{}
 	} else if algr == "lz4" {
 		return LZ4{}
 	} else if algr == "none" || algr == "" {
@@ -69,59 +66,73 @@ func (n noOp) Decompress(dst, src []byte) (int, error) {
 	return len(src), nil
 }
 
-// ZStandard implements Compressor interface using zstd library
-type ZStandard struct {
-	level int
-}
+// ZStandard implements Compressor using klauspost/compress/zstd (pure Go)
+type ZStandard struct{}
 
-// Name returns name of the algorithm Zstd
 func (n ZStandard) Name() string { return "Zstd" }
 
-// CompressBound max size of compressed data
-func (n ZStandard) CompressBound(l int) int { return zstd.CompressBound(l) }
+func (n ZStandard) CompressBound(l int) int {
+	// zstd worst case: input size + header overhead
+	return l + l/255 + 64
+}
 
-// Compress using Zstd
 func (n ZStandard) Compress(dst, src []byte) (int, error) {
-	d, err := zstd.CompressLevel(dst, src, n.level)
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
 	if err != nil {
 		return 0, err
 	}
+	d := enc.EncodeAll(src, dst[:0])
+	enc.Close()
 	if len(d) > 0 && len(dst) > 0 && &d[0] != &dst[0] {
-		return 0, fmt.Errorf("buffer too short: %d < %d", cap(dst), cap(d))
+		return 0, fmt.Errorf("buffer too short: %d < %d", cap(dst), len(d))
 	}
-	return len(d), err
+	return len(d), nil
 }
 
-// Decompress using Zstd
 func (n ZStandard) Decompress(dst, src []byte) (int, error) {
-	d, err := zstd.Decompress(dst, src)
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return 0, err
+	}
+	defer dec.Close()
+	d, err := dec.DecodeAll(src, dst[:0])
 	if err != nil {
 		return 0, err
 	}
 	if len(d) > 0 && len(dst) > 0 && &d[0] != &dst[0] {
 		return 0, fmt.Errorf("buffer too short: %d < %d", len(dst), len(d))
 	}
-	return len(d), err
+	return len(d), nil
 }
 
-// LZ4 implements Compressor using LZ4 library
+// LZ4 implements Compressor using pierrec/lz4 (pure Go)
 type LZ4 struct{}
 
-// Name returns name of the algorithm LZ4
 func (l LZ4) Name() string { return "LZ4" }
 
-// CompressBound max size of compressed data
-func (l LZ4) CompressBound(size int) int { return lz4.CompressBound(size) }
-
-// Compress using LZ4 algorithm
-func (l LZ4) Compress(dst, src []byte) (int, error) {
-	return lz4.CompressDefault(src, dst)
+func (l LZ4) CompressBound(size int) int {
+	return lz4.CompressBlockBound(size)
 }
 
-// Decompress using LZ4 algorithm
+func (l LZ4) Compress(dst, src []byte) (int, error) {
+	var c lz4.Compressor
+	n, err := c.CompressBlock(src, dst)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("data incompressible")
+	}
+	return n, nil
+}
+
 func (l LZ4) Decompress(dst, src []byte) (int, error) {
 	if len(src) == 0 {
 		return 0, fmt.Errorf("decompress an empty input")
 	}
-	return lz4.DecompressSafe(src, dst)
+	n, err := lz4.UncompressBlock(src, dst)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }

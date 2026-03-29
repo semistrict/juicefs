@@ -39,4 +39,9 @@ pkg/meta/testdata
 /juicefs.exe~
 /juicefsd.exe~
 /juicefs.lite
+/cfmount
+/juicefs-cfmount
 dist/
+/.claude
+CLAUDE.md
+node_modules/

@@ -1,0 +1,9 @@
+# Cloudflare dashboard → Workers & Pages → Overview → Account ID (right sidebar)
+CF_ACCOUNT_ID=your_account_id
+# R2 bucket name for JuiceFS data blocks
+R2_BUCKET=juicefs-data
+# Cloudflare dashboard → R2 → Manage R2 API Tokens → Create API Token
+# Grant "Object Read & Write" permission on your bucket
+R2_ACCESS_KEY_ID=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
+VOLUME_NAME=juicefs-dev
