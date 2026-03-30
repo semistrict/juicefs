@@ -1,0 +1,3 @@
+[submodule "shmipc-go"]
+	path = shmipc-go
+	url = git@github.com:semistrict/shmipc-go.git

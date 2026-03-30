@@ -89,7 +89,7 @@ func Main(args []string) error {
 		},
 	}
 
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS == "linux" {
 		app.Commands = append(app.Commands, cmdCacheServer())
 	}
 	if runtime.GOOS == "windows" {

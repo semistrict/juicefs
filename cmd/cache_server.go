@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 /*
  * JuiceFS, Copyright 2024 Juicedata, Inc.

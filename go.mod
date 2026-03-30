@@ -24,6 +24,7 @@ require (
 	github.com/ceph/go-ceph v0.18.0
 	github.com/charlievieth/fastwalk v1.0.14
 	github.com/cloudsoda/go-smb2 v0.0.0-20250228001242-d4c70e6251cc
+	github.com/cloudwego/shmipc-go v0.2.0
 	github.com/colinmarc/hdfs/v2 v2.4.0
 	github.com/davies/groupcache v0.0.0-20230821031435-e4e8362f58e1
 	github.com/dgraph-io/badger/v4 v4.9.1
@@ -147,13 +148,11 @@ require (
 	github.com/beevik/ntp v0.3.0 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bytedance/gopkg v0.0.0-20220817015305-b879a72dc90f // indirect
-	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
+	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cheggaaa/pb v1.0.29 // indirect
 	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
-	github.com/cloudwego/shmipc-go v0.2.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/coredns/coredns v1.4.0 // indirect
 	github.com/coreos/etcd v3.3.27+incompatible // indirect
@@ -277,7 +276,7 @@ require (
 	github.com/rs/xid v1.2.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/secure-io/sio-go v0.3.1 // indirect
-	github.com/shirou/gopsutil/v3 v3.23.11 // indirect
+	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/smartystreets/assertions v1.2.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
@@ -297,7 +296,7 @@ require (
 	github.com/willf/bitset v1.1.11 // indirect
 	github.com/willf/bloom v2.0.3+incompatible // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
-	github.com/yusufpapurcu/wmi v1.2.3 // indirect
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.9 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.5.9 // indirect
 	go.mongodb.org/mongo-driver v1.17.6 // indirect
@@ -364,3 +363,5 @@ replace github.com/mattn/go-colorable v0.0.9 => github.com/juicedata/go-colorabl
 replace github.com/cloudsoda/go-smb2 => github.com/juicedata/go-smb2 v0.0.0-20260310064141-58f27d06634e
 
 replace github.com/hashicorp/golang-lru/v2 v2.0.7 => github.com/juicedata/golang-lru/v2 v2.0.8-0.20251126062551-1b321869f904
+
+replace github.com/cloudwego/shmipc-go => ./shmipc-go

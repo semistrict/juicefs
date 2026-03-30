@@ -68,6 +68,7 @@ type pendingFile struct {
 	key       string
 	page      *Page
 	dropCache bool
+	done      chan struct{} // if non-nil, closed after this item is processed (used as sync barrier)
 }
 
 type cacheStore struct {
@@ -104,6 +105,8 @@ type cacheStore struct {
 	// newBlockCooldown reduces the initial access time for newly cached staged blocks.
 	// This helps prevent a surge of writes from evicting active read blocks.
 	stagedBlockCooldown time.Duration
+
+	closed chan struct{} // closed to signal background goroutines to stop
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -137,6 +140,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		uploader:            uploader,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
+		closed:              make(chan struct{}),
 	}
 	c.stateLock = sync.Mutex{}
 	if config.Writeback {
@@ -226,7 +230,9 @@ func (cache *cacheStore) createLockFile() {
 func (cache *cacheStore) checkLockFile() {
 	lockfile := cache.lockFilePath()
 	for cache.available() {
-		time.Sleep(time.Second * 10)
+		if !cache.sleep(time.Second * 10) {
+			return
+		}
 		if err := cache.statFile(lockfile); err != nil && os.IsNotExist(err) {
 			logger.Infof("lockfile %s is lost, cache device maybe broken", lockfile)
 			if inRootVolume(cache.dir) && cache.freeRatio < 0.2 {
@@ -238,7 +244,30 @@ func (cache *cacheStore) checkLockFile() {
 }
 
 func (c *cacheStore) available() bool {
+	select {
+	case <-c.closed:
+		return false
+	default:
+	}
 	return c.state.state() != dcDown
+}
+
+// sleep returns true if the sleep completed, false if the store was closed.
+func (c *cacheStore) sleep(d time.Duration) bool {
+	select {
+	case <-c.closed:
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+func (c *cacheStore) close() {
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
 }
 
 func (c *cacheStore) enabled() bool {
@@ -296,7 +325,9 @@ func (c *cacheStore) checkTimeout() {
 			}
 		}
 		c.opMu.Unlock()
-		time.Sleep(time.Second)
+		if !c.sleep(time.Second) {
+			return
+		}
 	}
 }
 
@@ -358,7 +389,9 @@ func (cache *cacheStore) checkFreeSpace() {
 		if cache.rawFull {
 			cache.uploadStaging()
 		}
-		time.Sleep(time.Second)
+		if !cache.sleep(time.Second) {
+			return
+		}
 	}
 	logger.Infof("stop checkFreeSpace at %s", cache.dir)
 }
@@ -403,7 +436,9 @@ func (cache *cacheStore) cleanupExpire() {
 			_ = cache.removeFile(cache.cachePath(cache.getPathFromKey(k)))
 		}
 		todel = todel[:0]
-		time.Sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1)))
+		if !cache.sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1))) {
+			return
+		}
 	}
 }
 
@@ -414,7 +449,9 @@ func (cache *cacheStore) refreshCacheKeys() {
 	cache.scanCached()
 	if cache.scanInterval > 0 {
 		for {
-			time.Sleep(cache.scanInterval)
+			if !cache.sleep(cache.scanInterval) {
+				return
+			}
 			cache.scanCached()
 		}
 	}
@@ -455,11 +492,11 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 	cache.pages[key] = p
 	atomic.AddInt64(&cache.totalPages, int64(cap(p.Data)))
 	select {
-	case cache.pending <- pendingFile{key, p, dropCache}:
+	case cache.pending <- pendingFile{key: key, page: p, dropCache: dropCache}:
 	default:
 		if force {
 			cache.Unlock()
-			cache.pending <- pendingFile{key, p, dropCache}
+			cache.pending <- pendingFile{key: key, page: p, dropCache: dropCache}
 			cache.Lock()
 		} else {
 			// does not have enough bandwidth to write it into disk, discard it
@@ -501,6 +538,9 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 
 func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8) (err error) {
 	if !cache.available() {
+		return errCacheDown
+	}
+	if cache.m == nil {
 		return errCacheDown
 	}
 
@@ -717,10 +757,29 @@ func (cache *cacheStore) stagePath(key string) string {
 	return filepath.Join(cache.dir, stagingDir, key)
 }
 
+// waitPending blocks until all pending cache writes have been flushed to disk.
+func (cache *cacheStore) waitPending() {
+	done := make(chan struct{})
+	cache.pending <- pendingFile{done: done}
+	<-done
+}
+
 // flush cached block into disk
 func (cache *cacheStore) flush() {
 	for {
-		w := <-cache.pending
+		var w pendingFile
+		select {
+		case w = <-cache.pending:
+		case <-cache.closed:
+			return
+		}
+		if w.done != nil {
+			if w.key != "" {
+				logger.Fatalf("pendingFile has both done channel and key %q", w.key)
+			}
+			close(w.done)
+			continue
+		}
 		path := cache.cachePath(w.key)
 		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0) == nil {
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))
@@ -1176,8 +1235,29 @@ func (m *cacheManager) cleanup() {
 func (m *cacheManager) close() {
 	select {
 	case <-m.closed:
+		return
 	default:
 		close(m.closed)
+	}
+	m.Lock()
+	for _, s := range m.stores {
+		if s != nil {
+			s.close()
+		}
+	}
+	m.Unlock()
+}
+
+// waitPending blocks until all stores have flushed their pending writes.
+func (m *cacheManager) waitPending() {
+	m.Lock()
+	stores := make([]*cacheStore, len(m.stores))
+	copy(stores, m.stores)
+	m.Unlock()
+	for _, s := range stores {
+		if s != nil {
+			s.waitPending()
+		}
 	}
 }
 

@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 /*
  * JuiceFS, Copyright 2024 Juicedata, Inc.
@@ -25,41 +25,44 @@ import (
 	"os"
 	"sync"
 	"syscall"
-
+	"github.com/cloudwego/shmipc-go"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// clientState tracks per-client state including which FDs have been sent.
+type sentFDInfo struct {
+	fileLength int
+}
+
 type clientState struct {
 	mu       sync.Mutex
-	sentFDs  map[string]struct{} // cache keys for which FD was already sent
-	ctrlConn *net.UnixConn       // UDS control connection for FD passing
+	sentFDs  map[string]sentFDInfo
+	ctrlConn *net.UnixConn
 	id       string
 }
 
 func newClientState(id string, ctrlConn *net.UnixConn) *clientState {
 	return &clientState{
-		sentFDs:  make(map[string]struct{}),
+		sentFDs:  make(map[string]sentFDInfo),
 		ctrlConn: ctrlConn,
 		id:       id,
 	}
 }
 
 // CacheServer wraps an existing CacheManager and serves it over
-// a UDS control channel (for FD passing) and a data channel.
+// a UDS control channel (for FD passing) and shmipc data channel.
 type CacheServer struct {
-	cache     CacheManager
-	ctrlSock  string // path for UDS control socket (FD passing)
-	dataSock  string // path for data socket (protocol messages + bulk data)
-	ctrlLn    *net.UnixListener
-	dataLn    *net.UnixListener
-	mu        sync.Mutex
-	clients   map[string]*clientState
-	closed    chan struct{}
-	checksum  string
+	cache    CacheManager
+	ctrlSock string
+	dataSock string
+	ctrlLn   *net.UnixListener
+	dataLn   *net.UnixListener
+	shmConf  *shmipc.Config
+	mu       sync.Mutex
+	clients  map[string]*clientState
+	closed   chan struct{}
+	checksum string
 }
 
-// NewCacheServer creates a new cache server wrapping the given CacheManager.
 func NewCacheServer(cache CacheManager, dataSock, ctrlSock, checksum string) *CacheServer {
 	return &CacheServer{
 		cache:    cache,
@@ -71,15 +74,12 @@ func NewCacheServer(cache CacheManager, dataSock, ctrlSock, checksum string) *Ca
 	}
 }
 
-// NewCacheServerWithConfig creates a CacheServer by first creating a local cacheManager.
 func NewCacheServerWithConfig(config *Config, reg prometheus.Registerer, dataSock, ctrlSock string) *CacheServer {
 	cm := newCacheManager(config, reg, nil)
 	return NewCacheServer(cm, dataSock, ctrlSock, config.CacheChecksum)
 }
 
-// ListenAndServe starts both the data and control listeners.
 func (s *CacheServer) ListenAndServe() error {
-	// Clean up old socket files
 	os.Remove(s.ctrlSock)
 	os.Remove(s.dataSock)
 
@@ -103,12 +103,16 @@ func (s *CacheServer) ListenAndServe() error {
 		return fmt.Errorf("listen data: %w", err)
 	}
 
+	if s.shmConf == nil {
+		s.shmConf = shmipc.DefaultConfig()
+		s.shmConf.ShareMemoryBufferCap = 32 << 20
+	}
+
 	go s.acceptCtrl()
 	go s.acceptData()
 	return nil
 }
 
-// Close shuts down the server and the underlying cache manager.
 func (s *CacheServer) Close() {
 	select {
 	case <-s.closed:
@@ -122,7 +126,11 @@ func (s *CacheServer) Close() {
 	if s.dataLn != nil {
 		s.dataLn.Close()
 	}
-	// Stop the cache manager's background goroutines
+	s.mu.Lock()
+	for _, cs := range s.clients {
+		cs.ctrlConn.Close()
+	}
+	s.mu.Unlock()
 	if cm, ok := s.cache.(*cacheManager); ok {
 		cm.close()
 	}
@@ -147,15 +155,12 @@ func (s *CacheServer) acceptCtrl() {
 }
 
 func (s *CacheServer) handleCtrlConn(conn *net.UnixConn) {
-	// Read client ID (first message on control channel)
-	buf := make([]byte, 128)
-	n, err := conn.Read(buf)
+	clientID, err := readClientID(conn)
 	if err != nil {
-		logger.Warnf("cache server: read client id: %s", err)
+		logger.Warnf("cache server: read client id (ctrl): %s", err)
 		conn.Close()
 		return
 	}
-	clientID := string(buf[:n])
 
 	s.mu.Lock()
 	cs := newClientState(clientID, conn)
@@ -164,9 +169,6 @@ func (s *CacheServer) handleCtrlConn(conn *net.UnixConn) {
 
 	logger.Infof("cache server: client %s connected (ctrl)", clientID)
 
-	// Keep the control connection alive until the client disconnects.
-	// The control channel is only used for server→client FD sends,
-	// triggered by the data channel handler. We just wait for EOF/error.
 	tmp := make([]byte, 1)
 	for {
 		_, err := conn.Read(tmp)
@@ -199,18 +201,15 @@ func (s *CacheServer) acceptData() {
 }
 
 func (s *CacheServer) handleDataConn(conn *net.UnixConn) {
-	defer conn.Close()
-
-	// First message: client ID to correlate with ctrl connection
-	buf := make([]byte, 128)
-	n, err := conn.Read(buf)
+	session, err := shmipc.Server(conn, s.shmConf)
 	if err != nil {
-		logger.Warnf("cache server: read client id on data: %s", err)
+		logger.Warnf("cache server: shmipc server session: %s", err)
+		conn.Close()
 		return
 	}
-	clientID := string(buf[:n])
-	logger.Infof("cache server: client %s connected (data)", clientID)
+	defer session.Close()
 
+	// Accept streams and handle each with a persistent read loop
 	for {
 		select {
 		case <-s.closed:
@@ -218,17 +217,52 @@ func (s *CacheServer) handleDataConn(conn *net.UnixConn) {
 		default:
 		}
 
-		req, err := decodeRequest(conn)
+		stream, err := session.AcceptStream()
 		if err != nil {
-			if err.Error() != "EOF" {
-				logger.Debugf("cache server: client %s read request: %s", clientID, err)
-			}
+			logger.Debugf("cache server: accept stream: %s", err)
 			return
 		}
+		go s.handleDataStream(stream)
+	}
+}
 
-		resp := s.handleRequest(clientID, req)
-		if _, err := conn.Write(encodeResponse(resp)); err != nil {
-			logger.Warnf("cache server: client %s write response: %s", clientID, err)
+// handleDataStream runs a sync read loop on a persistent stream.
+// Each iteration reads one request, processes it, writes the response.
+func (s *CacheServer) handleDataStream(stream *shmipc.Stream) {
+	defer stream.Close()
+	var req protoRequest
+	var clientID string // read once from first request, reused for all
+	for {
+		select {
+		case <-s.closed:
+			return
+		default:
+		}
+
+		reader := stream.BufferReader()
+		req.Op = 0
+		req.Flags = 0
+		req.ClientID = ""
+		req.Key = ""
+		req.Payload = nil
+		if err := decodeRequestFromBufInto(reader, &req); err != nil {
+			return
+		}
+		reader.ReleasePreviousRead()
+
+		// First request carries the client ID; subsequent ones may omit it
+		if req.ClientID != "" {
+			clientID = req.ClientID
+		}
+		req.ClientID = clientID
+
+		w := stream.BufferWriter()
+		if err := s.handleAndWriteResponse(&req, w); err != nil {
+			logger.Warnf("cache server: write response: %s", err)
+			return
+		}
+		if err := stream.Flush(false); err != nil {
+			logger.Warnf("cache server: flush response: %s", err)
 			return
 		}
 	}
@@ -240,10 +274,20 @@ func (s *CacheServer) getClient(clientID string) *clientState {
 	return s.clients[clientID]
 }
 
-func (s *CacheServer) handleRequest(clientID string, req *protoRequest) *protoResponse {
+// handleAndWriteResponse processes a request and writes the response directly
+// into shared memory, avoiding intermediate protoResponse allocations.
+func (s *CacheServer) handleAndWriteResponse(req *protoRequest, w shmipc.BufferWriter) error {
 	switch req.Op {
 	case opLoad:
-		return s.handleLoad(clientID, req)
+		return s.handleLoadDirect(req.ClientID, req, w)
+	default:
+		resp := s.handleRequest(req.ClientID, req)
+		return encodeResponseToShm(resp, w)
+	}
+}
+
+func (s *CacheServer) handleRequest(clientID string, req *protoRequest) *protoResponse {
+	switch req.Op {
 	case opCache:
 		return s.handleCache(req)
 	case opExist:
@@ -263,67 +307,108 @@ func (s *CacheServer) handleRequest(clientID string, req *protoRequest) *protoRe
 	}
 }
 
+// handleLoadDirect writes the LOAD response directly into shared memory,
+// avoiding protoResponse and encodeUint64 heap allocations on the hot path.
+func (s *CacheServer) handleLoadDirect(clientID string, req *protoRequest, w shmipc.BufferWriter) error {
+	cs := s.getClient(clientID)
+
+	// Fast path: FD already sent — zero alloc response
+	if cs != nil {
+		cs.mu.Lock()
+		info, alreadySent := cs.sentFDs[req.Key]
+		cs.mu.Unlock()
+		if alreadySent {
+			return writeResponseToShm(w, statusOK, flagFDCached, uint64(info.fileLength))
+		}
+	}
+
+	// Slow path: load from cache and send FD
+	rc, err := s.cache.load(req.Key)
+	if err != nil {
+		return writeResponseToShm(w, statusNotFound, 0)
+	}
+
+	cf, ok := rc.(*cacheFile)
+	if !ok {
+		rc.Close()
+		return encodeResponseToShm(&protoResponse{Status: statusError, Payload: []byte("not a file-backed cache entry")}, w)
+	}
+
+	size := cf.length
+
+	if cs == nil {
+		cf.Close()
+		return encodeResponseToShm(&protoResponse{Status: statusError, Payload: []byte("no control connection for client")}, w)
+	}
+
+	cs.mu.Lock()
+	fd := int(cf.File.Fd())
+	msg := make([]byte, 2+len(req.Key)+8)
+	binary.LittleEndian.PutUint16(msg[0:2], uint16(len(req.Key)))
+	copy(msg[2:2+len(req.Key)], req.Key)
+	binary.LittleEndian.PutUint64(msg[2+len(req.Key):], uint64(size))
+	err = sendFD(cs.ctrlConn, msg, fd)
+	if err != nil {
+		cs.mu.Unlock()
+		cf.Close()
+		logger.Warnf("cache server: send FD to %s: %s", clientID, err)
+		return encodeResponseToShm(&protoResponse{Status: statusError, Payload: []byte(err.Error())}, w)
+	}
+	cs.sentFDs[req.Key] = sentFDInfo{fileLength: size}
+	cs.mu.Unlock()
+	cf.Close()
+	return writeResponseToShm(w, statusOK, flagFDSent, uint64(size))
+}
+
 func (s *CacheServer) handleLoad(clientID string, req *protoRequest) *protoResponse {
 	cs := s.getClient(clientID)
 
-	// Try to load from cache
+	if cs != nil {
+		cs.mu.Lock()
+		info, alreadySent := cs.sentFDs[req.Key]
+		cs.mu.Unlock()
+		if alreadySent {
+			return &protoResponse{
+				Status:  statusOK,
+				Flags:   flagFDCached,
+				Payload: encodeUint64(uint64(info.fileLength)),
+			}
+		}
+	}
+
 	rc, err := s.cache.load(req.Key)
 	if err != nil {
 		return &protoResponse{Status: statusNotFound}
 	}
 
-	// Check if we already sent this FD to this client
-	if cs != nil {
-		cs.mu.Lock()
-		_, alreadySent := cs.sentFDs[req.Key]
-		cs.mu.Unlock()
-
-		if alreadySent {
-			// Client already has the FD, just tell them the size
-			if cf, ok := rc.(*cacheFile); ok {
-				size := cf.length
-				cf.Close()
-				return &protoResponse{
-					Status:  statusOK,
-					Flags:   flagFDCached,
-					Payload: encodeUint64(uint64(size)),
-				}
-			}
-			rc.Close()
-			return &protoResponse{Status: statusError, Payload: []byte("not a file-backed cache entry")}
-		}
-	}
-
-	// Need to send the FD
 	cf, ok := rc.(*cacheFile)
 	if !ok {
-		// Memory-backed entry, can't pass FD. Send data inline.
 		rc.Close()
 		return &protoResponse{Status: statusError, Payload: []byte("not a file-backed cache entry")}
 	}
 
 	size := cf.length
 
-	if cs != nil {
-		cs.mu.Lock()
-		// Send FD over the control channel
-		fd := int(cf.File.Fd())
-		// Send the key length + key as the msg alongside the FD so client can correlate
-		msg := make([]byte, 2+len(req.Key)+8)
-		binary.LittleEndian.PutUint16(msg[0:2], uint16(len(req.Key)))
-		copy(msg[2:2+len(req.Key)], req.Key)
-		binary.LittleEndian.PutUint64(msg[2+len(req.Key):], uint64(size))
-		err = sendFD(cs.ctrlConn, msg, fd)
-		if err != nil {
-			cs.mu.Unlock()
-			cf.Close()
-			logger.Warnf("cache server: send FD to %s: %s", clientID, err)
-			return &protoResponse{Status: statusError, Payload: []byte(err.Error())}
-		}
-		cs.sentFDs[req.Key] = struct{}{}
-		cs.mu.Unlock()
+	if cs == nil {
+		cf.Close()
+		return &protoResponse{Status: statusError, Payload: []byte("no control connection for client")}
 	}
 
+	cs.mu.Lock()
+	fd := int(cf.File.Fd())
+	msg := make([]byte, 2+len(req.Key)+8)
+	binary.LittleEndian.PutUint16(msg[0:2], uint16(len(req.Key)))
+	copy(msg[2:2+len(req.Key)], req.Key)
+	binary.LittleEndian.PutUint64(msg[2+len(req.Key):], uint64(size))
+	err = sendFD(cs.ctrlConn, msg, fd)
+	if err != nil {
+		cs.mu.Unlock()
+		cf.Close()
+		logger.Warnf("cache server: send FD to %s: %s", clientID, err)
+		return &protoResponse{Status: statusError, Payload: []byte(err.Error())}
+	}
+	cs.sentFDs[req.Key] = sentFDInfo{fileLength: size}
+	cs.mu.Unlock()
 	cf.Close()
 
 	return &protoResponse{
@@ -343,7 +428,6 @@ func (s *CacheServer) handleCache(req *protoRequest) *protoResponse {
 
 	page := NewPage(data)
 	s.cache.cache(req.Key, page, force, dropCache)
-	// Don't release page here — cache() takes ownership via pending channel
 	return &protoResponse{Status: statusOK}
 }
 
@@ -362,7 +446,6 @@ func (s *CacheServer) handleRemove(req *protoRequest) *protoResponse {
 	}
 	s.cache.remove(req.Key, staging)
 
-	// Invalidate FD tracking for all clients for this key
 	s.mu.Lock()
 	for _, cs := range s.clients {
 		cs.mu.Lock()
@@ -413,8 +496,6 @@ func (s *CacheServer) handleRemoveStage(req *protoRequest) *protoResponse {
 	return &protoResponse{Status: statusOK}
 }
 
-// fdReadCloser wraps an os.File created from a received file descriptor.
-// It implements the ReadCloser interface used by the cache system.
 type fdReadCloser struct {
 	f      *os.File
 	length int

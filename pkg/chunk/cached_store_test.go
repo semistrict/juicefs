@@ -349,6 +349,7 @@ func BenchmarkCachedRead(b *testing.B) {
 	config := defaultConf
 	config.BlockSize = 4 << 20
 	store := NewCachedStore(blob, config, nil)
+	defer store.(*cachedStore).Close()
 	w := store.NewWriter(1, 0)
 	if _, err := w.WriteAt(make([]byte, 1024), 0); err != nil {
 		b.Fatalf("write fail: %s", err)
@@ -373,6 +374,7 @@ func BenchmarkUncachedRead(b *testing.B) {
 	config.BlockSize = 4 << 20
 	config.CacheSize = 0
 	store := NewCachedStore(blob, config, nil)
+	defer store.(*cachedStore).Close()
 	w := store.NewWriter(2, 0)
 	if _, err := w.WriteAt(make([]byte, 1024), 0); err != nil {
 		b.Fatalf("write fail: %s", err)

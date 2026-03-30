@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build linux
 
 /*
  * JuiceFS, Copyright 2024 Juicedata, Inc.
@@ -28,45 +28,58 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/shmipc-go"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 var errServerUnavailable = errors.New("cache server unavailable")
 
-// remoteCacheManager implements CacheManager by forwarding requests
-// to a cache server over UDS. FDs for cache reads are received over
-// a separate control channel and cached locally for reuse.
+type fdEntry struct {
+	fd   int
+	size int
+}
+
+const defaultStreamPoolSize = 4
+
+// remoteCacheManager implements CacheManager by forwarding requests to a
+// cache server over shmipc. A pool of persistent streams provides concurrency.
+// FDs for cache reads are received over a separate UDS control channel.
 type remoteCacheManager struct {
 	dataSock string
 	ctrlSock string
 	clientID string
 
-	dataConn *net.UnixConn // data channel for protocol messages
-	ctrlConn *net.UnixConn // control channel for receiving FDs
-
-	dataMu sync.Mutex // serializes data channel requests
+	shmMgr     *shmipc.SessionManager // session management
+	streamPool chan *shmipc.Stream     // pool of persistent streams
+	idSent     sync.Map               // stream ptr → bool: whether clientID was sent on this stream
+	ctrlConn   *net.UnixConn          // control channel for receiving FDs
+	spinMicros int                     // polling spin duration in μs (0=disabled)
 
 	fdMu    sync.RWMutex
-	fdCache map[string]int // key -> file descriptor (kept open)
+	fdCache map[string]fdEntry // key -> cached FD + size
 
 	metrics *cacheManagerMetrics
 
 	ctrlDone chan struct{}
 }
 
-// newRemoteCacheManager connects to a cache server.
 func newRemoteCacheManager(dataSock, ctrlSock string, reg prometheus.Registerer) (CacheManager, error) {
+	return newRemoteCacheManagerWithSpin(dataSock, ctrlSock, reg, 0)
+}
+
+func newRemoteCacheManagerWithSpin(dataSock, ctrlSock string, reg prometheus.Registerer, spinMicros int) (CacheManager, error) {
 	clientID := uuid.New().String()
 	metrics := newCacheManagerMetrics(reg)
 
 	m := &remoteCacheManager{
-		dataSock: dataSock,
-		ctrlSock: ctrlSock,
-		clientID: clientID,
-		fdCache:  make(map[string]int),
-		metrics:  metrics,
-		ctrlDone: make(chan struct{}),
+		dataSock:   dataSock,
+		ctrlSock:   ctrlSock,
+		clientID:   clientID,
+		fdCache:    make(map[string]fdEntry),
+		metrics:    metrics,
+		ctrlDone:   make(chan struct{}),
+		spinMicros: spinMicros,
 	}
 
 	if err := m.connect(); err != nil {
@@ -87,41 +100,64 @@ func (m *remoteCacheManager) connect() error {
 	if err != nil {
 		return fmt.Errorf("dial ctrl: %w", err)
 	}
-	// Send client ID
-	if _, err := ctrlConn.Write([]byte(m.clientID)); err != nil {
+	if err := writeClientID(ctrlConn, m.clientID); err != nil {
 		ctrlConn.Close()
 		return fmt.Errorf("send client id (ctrl): %w", err)
 	}
 	m.ctrlConn = ctrlConn
 
-	// Connect data channel
-	dataAddr, err := net.ResolveUnixAddr("unix", m.dataSock)
+	// Connect shmipc data channel
+	cfg := shmipc.DefaultSessionManagerConfig()
+	cfg.Network = "unix"
+	cfg.Address = m.dataSock
+	cfg.SessionNum = 1
+	cfg.MaxStreamNum = 64
+	cfg.ShareMemoryPathPrefix = fmt.Sprintf("/dev/shm/jfs_cache_%s", m.clientID)
+	cfg.QueuePath = fmt.Sprintf("/dev/shm/jfs_cache_%s_queue", m.clientID)
+	cfg.ShareMemoryBufferCap = 32 << 20
+	if m.spinMicros > 0 {
+		cfg.PollingSpinDuration = time.Duration(m.spinMicros) * time.Microsecond
+	}
+	shmMgr, err := shmipc.NewSessionManager(cfg)
 	if err != nil {
 		ctrlConn.Close()
-		return fmt.Errorf("resolve data: %w", err)
+		return fmt.Errorf("shmipc session manager: %w", err)
 	}
-	dataConn, err := net.DialUnix("unix", nil, dataAddr)
-	if err != nil {
-		ctrlConn.Close()
-		return fmt.Errorf("dial data: %w", err)
+	m.shmMgr = shmMgr
+
+	// Pre-open persistent streams — one per CPU for parallelism
+	poolSize := runtime.NumCPU()
+	if poolSize < 1 {
+		poolSize = 1
 	}
-	if _, err := dataConn.Write([]byte(m.clientID)); err != nil {
-		ctrlConn.Close()
-		dataConn.Close()
-		return fmt.Errorf("send client id (data): %w", err)
+	if poolSize > defaultStreamPoolSize {
+		poolSize = defaultStreamPoolSize
 	}
-	m.dataConn = dataConn
+	m.streamPool = make(chan *shmipc.Stream, poolSize)
+	for i := 0; i < poolSize; i++ {
+		stream, err := shmMgr.GetStream()
+		if err != nil {
+			ctrlConn.Close()
+			shmMgr.Close()
+			return fmt.Errorf("open stream %d: %w", i, err)
+		}
+		m.streamPool <- stream
+	}
 
 	return nil
 }
 
-// recvFDs runs in a goroutine, receiving FDs from the control channel
-// and storing them in the local fdCache.
 func (m *remoteCacheManager) recvFDs() {
 	defer close(m.ctrlDone)
 	for {
+		// Set a deadline so Recvmsg unblocks periodically, allowing
+		// close() to terminate this goroutine.
+		m.ctrlConn.SetReadDeadline(time.Now().Add(time.Second))
 		msg, fds, err := recvFD(m.ctrlConn, 1)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // deadline expired, loop and try again
+			}
 			logger.Debugf("remote cache: recv FD: %s", err)
 			return
 		}
@@ -137,13 +173,17 @@ func (m *remoteCacheManager) recvFDs() {
 		}
 		key := string(msg[2 : 2+keyLen])
 
-		m.fdMu.Lock()
-		if oldFD, exists := m.fdCache[key]; exists {
-			closefd(oldFD)
+		fileSize := 0
+		if int(keyLen)+2+8 <= len(msg) {
+			fileSize = int(binary.LittleEndian.Uint64(msg[2+keyLen : 2+keyLen+8]))
 		}
-		m.fdCache[key] = fds[0]
+
+		m.fdMu.Lock()
+		if old, exists := m.fdCache[key]; exists {
+			closefd(old.fd)
+		}
+		m.fdCache[key] = fdEntry{fd: fds[0], size: fileSize}
 		m.fdMu.Unlock()
-		// Close extra FDs if any
 		for i := 1; i < len(fds); i++ {
 			closefd(fds[i])
 		}
@@ -154,19 +194,46 @@ func closefd(fd int) {
 	os.NewFile(uintptr(fd), "").Close()
 }
 
-// sendRequest sends a request and reads the response, holding the data lock.
+// sendRequest gets a persistent stream from the pool, writes the request
+// directly into shared memory, reads the response, then returns the stream.
 func (m *remoteCacheManager) sendRequest(req *protoRequest) (*protoResponse, error) {
-	m.dataMu.Lock()
-	defer m.dataMu.Unlock()
-
-	if m.dataConn == nil {
+	if m.streamPool == nil {
 		return nil, errServerUnavailable
 	}
 
-	if _, err := m.dataConn.Write(encodeRequest(req)); err != nil {
+	stream := <-m.streamPool
+
+	// If the stream's session is dead (server crashed), don't write to
+	// unmapped shared memory — return the stream and report error.
+	if !stream.Session().IsHealthy() {
+		m.streamPool <- stream // return to pool (caller can retry or close)
+		return nil, errServerUnavailable
+	}
+
+	// Send client ID only on the first request per stream
+	if _, sent := m.idSent.LoadOrStore(stream, true); !sent {
+		req.ClientID = m.clientID
+	}
+
+	if err := encodeRequestToShm(req, stream.BufferWriter()); err != nil {
+		stream.Close()
 		return nil, fmt.Errorf("send request: %w", err)
 	}
-	return decodeResponse(m.dataConn)
+	if err := stream.Flush(false); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("flush request: %w", err)
+	}
+
+	reader := stream.BufferReader()
+	resp, err := decodeResponseFromBuf(reader)
+	if err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	reader.ReleasePreviousRead()
+
+	m.streamPool <- stream
+	return resp, nil
 }
 
 func (m *remoteCacheManager) cache(key string, p *Page, force, dropCache bool) {
@@ -203,16 +270,23 @@ func (m *remoteCacheManager) remove(key string, staging bool) {
 		logger.Warnf("remote cache: remove %s: %s", key, err)
 	}
 
-	// Also remove from local FD cache
 	m.fdMu.Lock()
-	if fd, ok := m.fdCache[key]; ok {
-		closefd(fd)
+	if entry, ok := m.fdCache[key]; ok {
+		closefd(entry.fd)
 		delete(m.fdCache, key)
 	}
 	m.fdMu.Unlock()
 }
 
 func (m *remoteCacheManager) load(key string) (ReadCloser, error) {
+	// Fast path: FD already cached locally — skip the server round-trip entirely.
+	m.fdMu.RLock()
+	if entry, ok := m.fdCache[key]; ok {
+		m.fdMu.RUnlock()
+		return newFDReadCloserNonOwning(entry.fd, entry.size), nil
+	}
+	m.fdMu.RUnlock()
+
 	resp, err := m.sendRequest(&protoRequest{
 		Op:  opLoad,
 		Key: key,
@@ -230,18 +304,14 @@ func (m *remoteCacheManager) load(key string) (ReadCloser, error) {
 	if len(resp.Payload) < 8 {
 		return nil, fmt.Errorf("remote cache: load %s: short payload", key)
 	}
-	size := int(decodeUint64(resp.Payload[:8]))
 
 	if resp.Flags == flagFDSent {
-		// FD is being sent over control channel — wait for it.
-		// The recvFDs goroutine will populate fdCache asynchronously.
-		// The FD was sent before the data response, so it should arrive quickly.
 		for i := 0; i < 200; i++ {
 			m.fdMu.RLock()
-			fd, ok := m.fdCache[key]
+			entry, ok := m.fdCache[key]
 			m.fdMu.RUnlock()
 			if ok {
-				return newFDReadCloserNonOwning(fd, size), nil
+				return newFDReadCloserNonOwning(entry.fd, entry.size), nil
 			}
 			runtime.Gosched()
 			if i > 10 {
@@ -251,18 +321,15 @@ func (m *remoteCacheManager) load(key string) (ReadCloser, error) {
 		return nil, fmt.Errorf("remote cache: load %s: FD not received", key)
 	}
 
-	// FD_CACHED: we should already have it
 	m.fdMu.RLock()
-	fd, ok := m.fdCache[key]
+	entry, ok := m.fdCache[key]
 	m.fdMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("remote cache: load %s: FD_CACHED but no local FD", key)
 	}
-	return newFDReadCloserNonOwning(fd, size), nil
+	return newFDReadCloserNonOwning(entry.fd, entry.size), nil
 }
 
-// fdReadCloserNonOwning wraps a file descriptor for ReadAt without owning it.
-// Close() is a no-op since the FD is cached for reuse.
 type fdReadCloserNonOwning struct {
 	fd     int
 	length int
@@ -277,11 +344,9 @@ func (r *fdReadCloserNonOwning) ReadAt(b []byte, off int64) (int, error) {
 }
 
 func (r *fdReadCloserNonOwning) Close() error {
-	// Don't close — FD is cached for reuse
 	return nil
 }
 
-// readAtFD does a pread on a raw file descriptor.
 func readAtFD(fd int, b []byte, off int64) (int, error) {
 	var total int
 	for total < len(b) {
@@ -300,10 +365,7 @@ func readAtFD(fd int, b []byte, off int64) (int, error) {
 }
 
 func (m *remoteCacheManager) exist(key string) (string, bool) {
-	resp, err := m.sendRequest(&protoRequest{
-		Op:  opExist,
-		Key: key,
-	})
+	resp, err := m.sendRequest(&protoRequest{Op: opExist, Key: key})
 	if err != nil {
 		return "", false
 	}
@@ -314,11 +376,10 @@ func (m *remoteCacheManager) exist(key string) (string, bool) {
 }
 
 func (m *remoteCacheManager) uploaded(key string, size int) {
-	payload := encodeUint32(uint32(size))
 	_, err := m.sendRequest(&protoRequest{
 		Op:      opUploaded,
 		Key:     key,
-		Payload: payload,
+		Payload: encodeUint32(uint32(size)),
 	})
 	if err != nil {
 		logger.Warnf("remote cache: uploaded %s: %s", key, err)
@@ -330,11 +391,7 @@ func (m *remoteCacheManager) stage(key string, data []byte, tierID uint8) (strin
 	payload[0] = tierID
 	copy(payload[1:], data)
 
-	resp, err := m.sendRequest(&protoRequest{
-		Op:      opStage,
-		Key:     key,
-		Payload: payload,
-	})
+	resp, err := m.sendRequest(&protoRequest{Op: opStage, Key: key, Payload: payload})
 	if err != nil {
 		return "", err
 	}
@@ -345,10 +402,7 @@ func (m *remoteCacheManager) stage(key string, data []byte, tierID uint8) (strin
 }
 
 func (m *remoteCacheManager) removeStage(key string) error {
-	resp, err := m.sendRequest(&protoRequest{
-		Op:  opRemoveStag,
-		Key: key,
-	})
+	resp, err := m.sendRequest(&protoRequest{Op: opRemoveStag, Key: key})
 	if err != nil {
 		return err
 	}
@@ -366,19 +420,32 @@ func (m *remoteCacheManager) stats() (int64, int64) {
 	if resp.Status != statusOK || len(resp.Payload) < 16 {
 		return 0, 0
 	}
-	cnt := int64(decodeUint64(resp.Payload[0:8]))
-	used := int64(decodeUint64(resp.Payload[8:16]))
-	return cnt, used
+	return int64(decodeUint64(resp.Payload[0:8])), int64(decodeUint64(resp.Payload[8:16]))
 }
 
-func (m *remoteCacheManager) usedMemory() int64 {
-	return 0
-}
+func (m *remoteCacheManager) usedMemory() int64 { return 0 }
+func (m *remoteCacheManager) isEmpty() bool      { return false }
 
-func (m *remoteCacheManager) isEmpty() bool {
-	// Remote cache is never "empty" in the sense that triggers fallback to memStore.
-	// The server manages its own cache directory lifecycle.
-	return false
+func (m *remoteCacheManager) close() {
+	if m.ctrlConn != nil {
+		m.ctrlConn.Close()
+	}
+	<-m.ctrlDone
+	if m.streamPool != nil {
+		close(m.streamPool)
+		for s := range m.streamPool {
+			s.Close()
+		}
+	}
+	if m.shmMgr != nil {
+		m.shmMgr.Close()
+	}
+	m.fdMu.Lock()
+	for key, entry := range m.fdCache {
+		closefd(entry.fd)
+		delete(m.fdCache, key)
+	}
+	m.fdMu.Unlock()
 }
 
 func (m *remoteCacheManager) getMetrics() *cacheManagerMetrics {

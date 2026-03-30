@@ -665,6 +665,14 @@ func (c *Config) CacheEnabled() bool {
 	return c.CacheSize > 0 || c.CacheServerData != ""
 }
 
+// Close stops all background goroutines associated with the cache.
+func (store *cachedStore) Close() {
+	close(store.closed)
+	if cm, ok := store.bcache.(*cacheManager); ok {
+		cm.close()
+	}
+}
+
 type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
@@ -682,6 +690,7 @@ type cachedStore struct {
 	seekable        bool
 	upLimit         *ratelimit.Bucket
 	downLimit       *ratelimit.Bucket
+	closed          chan struct{}
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -849,6 +858,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:     make(map[string]*pendingItem),
 		group:           NewController(),
+		closed:          make(chan struct{}),
 	}
 	if config.UploadLimit > 0 {
 		// there are overheads coming from HTTP/TCP/IP
@@ -891,13 +901,22 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 
 	go func() {
 		for {
+			select {
+			case <-store.closed:
+				return
+			default:
+			}
 			if store.bcache.isEmpty() {
 				logger.Warn("cache store is empty, use memory cache")
 				config.CacheSize = 100 << 20
 				config.CacheDir = "memory"
 				store.bcache = newMemStore(&config, store.bcache.getMetrics())
 			}
-			time.Sleep(time.Second)
+			select {
+			case <-store.closed:
+				return
+			case <-time.After(time.Second):
+			}
 		}
 	}()
 
