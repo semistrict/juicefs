@@ -1,0 +1,58 @@
+# Lima VM for testing JuiceFS shared cache
+# Usage: limactl create --name=jfs-cache hack/sharedcache/lima.yaml
+#        limactl start jfs-cache
+
+arch: "aarch64"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "8GiB"
+disk: "40GiB"
+
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+
+mountType: "reverse-sshfs"
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Redis
+      if ! command -v redis-server &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq redis-server wget
+        systemctl enable redis-server
+        systemctl start redis-server
+      fi
+
+      # Go
+      if ! command -v go &>/dev/null; then
+        GO_VERSION=1.24.0
+        ARCH=$(dpkg --print-architecture)
+        curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xzf -
+        echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
+      fi
+
+      # FUSE + build tools
+      apt-get update -qq
+      apt-get install -y -qq fuse3 libfuse3-dev build-essential wget
+
+probes:
+  - description: "redis is ready"
+    script: |
+      #!/bin/bash
+      redis-cli ping | grep -q PONG
+    hint: "Waiting for redis..."

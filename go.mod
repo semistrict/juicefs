@@ -147,10 +147,13 @@ require (
 	github.com/beevik/ntp v0.3.0 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bytedance/gopkg v0.0.0-20220817015305-b879a72dc90f // indirect
+	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cheggaaa/pb v1.0.29 // indirect
 	github.com/clbanning/mxj v1.8.4 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
+	github.com/cloudwego/shmipc-go v0.2.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect
 	github.com/coredns/coredns v1.4.0 // indirect
 	github.com/coreos/etcd v3.3.27+incompatible // indirect

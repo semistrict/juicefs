@@ -557,6 +557,8 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+	CacheServerData        string // UDS path for cache server data channel
+	CacheServerCtrl        string // UDS path for cache server control channel (FD passing)
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -660,7 +662,7 @@ func (c *Config) parseHours() (start, end int, err error) {
 }
 
 func (c *Config) CacheEnabled() bool {
-	return c.CacheSize > 0
+	return c.CacheSize > 0 || c.CacheServerData != ""
 }
 
 type cachedStore struct {
@@ -862,14 +864,30 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 			logger.Infof("background upload at %d:00 ~ %d:00", store.startHour, store.endHour)
 		}
 	}
-	store.bcache = newCacheManager(&config, reg, func(key, fpath string, force bool) bool {
-		if fi, err := os.Stat(fpath); err == nil {
-			return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
-		} else {
-			logger.Warnf("Stat staging block %s: %s", fpath, err)
-			return false
+	if config.CacheServerData != "" && config.CacheServerCtrl != "" {
+		var err error
+		store.bcache, err = newRemoteCacheManager(config.CacheServerData, config.CacheServerCtrl, reg)
+		if err != nil {
+			logger.Warnf("Failed to connect to cache server, falling back to local cache: %s", err)
+			store.bcache = newCacheManager(&config, reg, func(key, fpath string, force bool) bool {
+				if fi, err := os.Stat(fpath); err == nil {
+					return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
+				} else {
+					logger.Warnf("Stat staging block %s: %s", fpath, err)
+					return false
+				}
+			})
 		}
-	})
+	} else {
+		store.bcache = newCacheManager(&config, reg, func(key, fpath string, force bool) bool {
+			if fi, err := os.Stat(fpath); err == nil {
+				return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
+			} else {
+				logger.Warnf("Stat staging block %s: %s", fpath, err)
+				return false
+			}
+		})
+	}
 
 	go func() {
 		for {

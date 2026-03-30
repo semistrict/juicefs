@@ -393,6 +393,8 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		CacheExpire:       utils.Duration(c.String("cache-expire")),
 		OSCache:           os.Getenv("JFS_DROP_OSCACHE") == "",
 		AutoCreate:        true,
+		CacheServerData:   c.String("cache-server-data"),
+		CacheServerCtrl:   c.String("cache-server-ctrl"),
 	}
 	if c.IsSet("max-readahead") {
 		chunkConf.Readahead = int(utils.ParseBytes(c, "max-readahead", 'M'))

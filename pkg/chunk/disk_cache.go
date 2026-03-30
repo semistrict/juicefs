@@ -1034,6 +1034,7 @@ type cacheManager struct {
 	storeMap      map[string]*cacheStore
 	stores        []*cacheStore
 	metrics       *cacheManagerMetrics
+	closed        chan struct{}
 }
 
 func legacyKeyHash(s string) uint32 {
@@ -1127,6 +1128,7 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 		storeMap:      make(map[string]*cacheStore, len(dirs)),
 		stores:        make([]*cacheStore, len(dirs)),
 		metrics:       metrics,
+		closed:        make(chan struct{}),
 	}
 
 	// 20% of buffer could be used for pending pages
@@ -1147,6 +1149,11 @@ func (m *cacheManager) getMetrics() *cacheManagerMetrics {
 
 func (m *cacheManager) cleanup() {
 	for !m.isEmpty() {
+		select {
+		case <-m.closed:
+			return
+		default:
+		}
 		var ids []string
 		m.Lock()
 		for id, s := range m.storeMap {
@@ -1158,7 +1165,19 @@ func (m *cacheManager) cleanup() {
 		for _, id := range ids {
 			m.removeStore(id)
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-m.closed:
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (m *cacheManager) close() {
+	select {
+	case <-m.closed:
+	default:
+		close(m.closed)
 	}
 }
 

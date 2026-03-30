@@ -273,6 +273,14 @@ func dataCacheFlags() []cli.Flag {
 			Value: "0s",
 			Usage: "cached blocks not accessed for longer than this option will be automatically evicted (0 means never)",
 		},
+		&cli.StringFlag{
+			Name:  "cache-server-data",
+			Usage: "UDS path for shared cache server data channel",
+		},
+		&cli.StringFlag{
+			Name:  "cache-server-ctrl",
+			Usage: "UDS path for shared cache server control channel (FD passing)",
+		},
 	})
 }
 

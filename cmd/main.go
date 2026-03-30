@@ -89,6 +89,9 @@ func Main(args []string) error {
 		},
 	}
 
+	if runtime.GOOS != "windows" {
+		app.Commands = append(app.Commands, cmdCacheServer())
+	}
 	if runtime.GOOS == "windows" {
 		app.Commands = append(app.Commands, cmdPrintSID())
 	}
