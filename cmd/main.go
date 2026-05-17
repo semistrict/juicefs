@@ -86,6 +86,7 @@ func Main(args []string) error {
 			cmdClone(),
 			cmdSummary(),
 			cmdCompact(),
+			cmdAccessProfile(),
 			cmdTier(),
 		},
 	}
@@ -236,13 +237,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 		return newArgs
 	}
 	cmdName := others[0]
-	var cmd *cli.Command
-	for _, c := range app.Commands {
-		if c.Name == cmdName {
-			cmd = c
-			break
-		}
-	}
+	cmd := findCommand(app.Commands, cmdName)
 	if cmd == nil {
 		// can't recognize the command, skip it
 		return append(newArgs, others...)
@@ -264,10 +259,41 @@ func reorderOptions(app *cli.App, args []string) []string {
 			if strings.HasPrefix(option, "-") && !utils.StringContains(args, "--generate-bash-completion") {
 				logger.Fatalf("unknown option: %q", option)
 			}
+			if subcmd := findCommand(cmd.Subcommands, option); subcmd != nil {
+				newArgs = append(newArgs, option)
+				subArgs := args[i+1:]
+				subFlags := append(subcmd.Flags, cli.HelpFlag)
+				others = nil
+				for j := 0; j < len(subArgs); j++ {
+					subOption := subArgs[j]
+					if ok, hasValue := isFlag(subFlags, subOption); ok {
+						newArgs = append(newArgs, subOption)
+						if hasValue && len(subArgs[j+1:]) > 0 {
+							j++
+							newArgs = append(newArgs, subArgs[j])
+						}
+					} else {
+						if strings.HasPrefix(subOption, "-") && !utils.StringContains(subArgs, "--generate-bash-completion") {
+							logger.Fatalf("unknown option: %q", subOption)
+						}
+						others = append(others, subOption)
+					}
+				}
+				return append(newArgs, others...)
+			}
 			others = append(others, option)
 		}
 	}
 	return append(newArgs, others...)
+}
+
+func findCommand(commands []*cli.Command, name string) *cli.Command {
+	for _, c := range commands {
+		if c.Name == name || utils.StringContains(c.Aliases, name) {
+			return c
+		}
+	}
+	return nil
 }
 
 // Check number of positional arguments, set logger level and setup agent if needed

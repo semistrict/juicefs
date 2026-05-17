@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// AccessProfile is a message to control access profile recording and loading.
+	AccessProfile = 1009
 )
 
 const (

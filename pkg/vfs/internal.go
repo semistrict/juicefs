@@ -587,6 +587,26 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		writeProgress(&totalChunks, &currChunks, out, done)
 		_, _ = out.Write([]byte{uint8(eno)})
 
+	case meta.AccessProfile:
+		var req AccessProfileRequest
+		if err := json.Unmarshal(r.Buffer(), &req); err != nil {
+			logger.Warnf("invalid access profile request: %s", err)
+			_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+			return
+		}
+		resp := v.accessProfiles.Handle(ctx, req)
+		data, err := json.Marshal(resp)
+		if err != nil {
+			logger.Errorf("marshal access profile response: %v", err)
+			_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
+			return
+		}
+		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		_, _ = out.Write(w.Bytes())
+
 	case meta.FillCache:
 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")
 		concurrent := r.Get16()

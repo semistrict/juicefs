@@ -791,6 +791,10 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
 	}
+	if err == 0 && n > 0 {
+		v.accessProfiles.RecordAccess(ino, 'r', off, uint64(n))
+		v.accessProfiles.RecordWarmRead(ino, off, uint64(n))
+	}
 	if err == syscall.ENOENT {
 		err = syscall.EBADF
 	}
@@ -856,6 +860,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 
 	if err == 0 {
 		writtenSizeHistogram.Observe(float64(len(buf)))
+		v.accessProfiles.RecordAccess(ino, 'w', off, size)
 		v.reader.Invalidate(ino, off, size)
 		v.invalidateAttr(ino)
 	}
@@ -1215,7 +1220,6 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 	} else {
 		err = v.Meta.RemoveXattr(ctx, ino, name)
 	}
-
 	return
 }
 
@@ -1240,6 +1244,8 @@ type VFS struct {
 	modifiedAt map[Ino]time.Time
 
 	registry *prometheus.Registry
+
+	accessProfiles *accessProfileManager
 }
 
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {
@@ -1259,6 +1265,7 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		nextfh:      1,
 		registry:    registry,
 	}
+	v.accessProfiles = newAccessProfileManager(v)
 
 	n := getInternalNode(ConfigInode)
 	v.Conf.Format.RemoveSecret()
@@ -1396,6 +1403,7 @@ func InitMetrics(registerer prometheus.Registerer) {
 	registerer.MustRegister(opsDurations)
 	registerer.MustRegister(opsIOErrors)
 	registerer.MustRegister(compactSizeHistogram)
+	registerAccessProfileMetrics(registerer)
 }
 
 // Linux ACL format:
