@@ -3605,6 +3605,7 @@ func testBatchClone(t *testing.T, m Meta) {
 		if string(val) != "hello" {
 			t.Fatalf("xattr value: got %q, want %q", val, "hello")
 		}
+		assertNoCloneSourceXattr(t, m, e.Inode)
 	}
 
 	// verify sym1 clone: target
@@ -3630,6 +3631,7 @@ func testBatchClone(t *testing.T, m Meta) {
 		if e.Attr.Length != 0 {
 			t.Fatalf("file2 length: got %d, want 0", e.Attr.Length)
 		}
+		assertNoCloneSourceXattr(t, m, e.Inode)
 	}
 
 	// --- test 2: duplicate entry names (EEXIST) ---
@@ -3880,6 +3882,31 @@ func testClone(t *testing.T, m Meta) {
 	if eno := m.Remove(Background(), cloneDir, "no_preserve", false, RmrDefaultThreads, nil); eno != 0 {
 		t.Fatalf("Rmdir: %s", eno)
 	}
+
+	var fileClone Ino
+	if eno := m.Clone(Background(), dir1, file1, cloneDir, "file1Clone", 0, 022, 4, &count, &total); eno != 0 {
+		t.Fatalf("clone file: %s", eno)
+	}
+	if eno := m.Lookup(Background(), cloneDir, "file1Clone", &fileClone, &Attr{}, true); eno != 0 {
+		t.Fatalf("lookup file clone: %s", eno)
+	}
+	assertCloneSourceXattr(t, m, fileClone, file1)
+
+	var fileClone2 Ino
+	if eno := m.Clone(Background(), cloneDir, fileClone, cloneDir, "file1Clone2", 0, 022, 4, &count, &total); eno != 0 {
+		t.Fatalf("clone cloned file: %s", eno)
+	}
+	if eno := m.Lookup(Background(), cloneDir, "file1Clone2", &fileClone2, &Attr{}, true); eno != 0 {
+		t.Fatalf("lookup second file clone: %s", eno)
+	}
+	assertCloneSourceXattr(t, m, fileClone2, fileClone)
+	if eno := m.Remove(Background(), cloneDir, "file1Clone", false, RmrDefaultThreads, nil); eno != 0 {
+		t.Fatalf("remove file clone: %s", eno)
+	}
+	if eno := m.Remove(Background(), cloneDir, "file1Clone2", false, RmrDefaultThreads, nil); eno != 0 {
+		t.Fatalf("remove second file clone: %s", eno)
+	}
+
 	// check attr
 	var removedItem []interface{}
 	checkEntryTree(t, m, dir1, cloneDstIno, func(srcEntry, dstEntry *Entry, dstIno Ino) {
@@ -4074,6 +4101,27 @@ func checkEntry(t *testing.T, m Meta, srcEntry, dstEntry *Entry, dstParentIno In
 		if !bytes.Equal(v1, v2) {
 			t.Fatalf("xattr not equal")
 		}
+	}
+	assertNoCloneSourceXattr(t, m, dstEntry.Inode)
+}
+
+func assertCloneSourceXattr(t *testing.T, m Meta, inode, srcIno Ino) {
+	t.Helper()
+	var value []byte
+	if eno := m.GetXattr(Background(), inode, CloneSourceXattr, &value); eno != 0 {
+		t.Fatalf("get clone source xattr for inode %d: %s", inode, eno)
+	}
+	want := strconv.FormatUint(uint64(srcIno), 10)
+	if string(value) != want {
+		t.Fatalf("clone source xattr for inode %d: got %q, want %q", inode, value, want)
+	}
+}
+
+func assertNoCloneSourceXattr(t *testing.T, m Meta, inode Ino) {
+	t.Helper()
+	var value []byte
+	if eno := m.GetXattr(Background(), inode, CloneSourceXattr, &value); eno != ENOATTR {
+		t.Fatalf("clone source xattr for inode %d: got %s with value %q, want ENOATTR", inode, eno, value)
 	}
 }
 

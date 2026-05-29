@@ -5302,6 +5302,9 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 		if err != nil {
 			return err
 		}
+		if top && attr.Typ == TypeFile {
+			srcXattr[CloneSourceXattr] = string(cloneSourceXattrValue(srcIno))
+		}
 
 		var pattr Attr
 		if top {

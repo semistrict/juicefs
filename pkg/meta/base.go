@@ -54,6 +54,8 @@ const (
 	unknownUsage   = -1
 )
 
+const CloneSourceXattr = "user.juicefs.clone.source_ino"
+
 var (
 	DirBatchNum = map[string]int{
 		"redis": 4096,
@@ -70,6 +72,10 @@ func checkInodeName(name string) syscall.Errno {
 		return syscall.EINVAL
 	}
 	return 0
+}
+
+func cloneSourceXattrValue(srcIno Ino) []byte {
+	return []byte(strconv.FormatUint(uint64(srcIno), 10))
 }
 
 type engine interface {

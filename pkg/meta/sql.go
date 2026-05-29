@@ -5378,11 +5378,23 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			return err
 		}
 		if len(xs) > 0 {
+			setCloneSourceXattr := top && n.Type == TypeFile
 			for i := range xs {
 				xs[i].Id = 0
 				xs[i].Inode = ino
+				if setCloneSourceXattr && xs[i].Name == CloneSourceXattr {
+					xs[i].Value = cloneSourceXattrValue(srcIno)
+					setCloneSourceXattr = false
+				}
+			}
+			if setCloneSourceXattr {
+				xs = append(xs, xattr{Inode: ino, Name: CloneSourceXattr, Value: cloneSourceXattrValue(srcIno)})
 			}
 			if err := mustInsert(s, &xs); err != nil {
+				return err
+			}
+		} else if top && n.Type == TypeFile {
+			if err := mustInsert(s, &xattr{Inode: ino, Name: CloneSourceXattr, Value: cloneSourceXattrValue(srcIno)}); err != nil {
 				return err
 			}
 		}

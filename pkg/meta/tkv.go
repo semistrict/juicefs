@@ -4459,6 +4459,9 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			tx.set(m.xattrKey(ino, string(k[len(prefix):])), v)
 			return true
 		})
+		if top && attr.Typ == TypeFile {
+			tx.set(m.xattrKey(ino, CloneSourceXattr), cloneSourceXattrValue(srcIno))
+		}
 		if top && attr.Typ == TypeDirectory {
 			tx.set(m.detachedKey(ino), m.packInt64(time.Now().Unix()))
 		} else {
