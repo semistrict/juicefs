@@ -28,6 +28,7 @@ type SharedExtentSourceSpan struct {
 	Len         uint64 `json:"len"`
 	SourceIndex int    `json:"sourceIndex"`
 	SourceIno   Ino    `json:"sourceIno"`
+	SourceOff   uint64 `json:"sourceOff"`
 }
 
 type sharedExtentSliceSpan struct {
@@ -64,7 +65,8 @@ func (v *VFS) SharedExtentSources(ctx meta.Context, req *SharedExtentSourcesRequ
 	if req == nil || len(req.Files) < 2 || len(req.Ranges) == 0 {
 		return nil, syscall.EINVAL
 	}
-	for _, ino := range req.Files {
+	lengths := make([]uint64, len(req.Files))
+	for i, ino := range req.Files {
 		var attr meta.Attr
 		if st := v.Meta.GetAttr(ctx, ino, &attr); st != 0 {
 			return nil, st
@@ -72,6 +74,7 @@ func (v *VFS) SharedExtentSources(ctx meta.Context, req *SharedExtentSourcesRequ
 		if attr.Typ != meta.TypeFile {
 			return nil, syscall.EINVAL
 		}
+		lengths[i] = attr.Length
 	}
 
 	resp := &SharedExtentSourcesResponse{}
@@ -79,7 +82,7 @@ func (v *VFS) SharedExtentSources(ctx meta.Context, req *SharedExtentSourcesRequ
 		if rg.Len == 0 || rg.Off+rg.Len < rg.Off {
 			return nil, syscall.EINVAL
 		}
-		spans, st := v.sharedExtentSourceSpans(ctx, req.Files, rg.Off, rg.Len)
+		spans, st := v.sharedExtentSourceSpans(ctx, req.Files, lengths, rg.Off, rg.Len)
 		if st != 0 {
 			return nil, st
 		}
@@ -90,11 +93,30 @@ func (v *VFS) SharedExtentSources(ctx meta.Context, req *SharedExtentSourcesRequ
 	return resp, 0
 }
 
-func (v *VFS) sharedExtentSourceSpans(ctx meta.Context, files []Ino, off, length uint64) ([]SharedExtentSourceSpan, syscall.Errno) {
+func (v *VFS) sharedExtentSourceSpans(ctx meta.Context, files []Ino, lengths []uint64, off, length uint64) ([]SharedExtentSourceSpan, syscall.Errno) {
 	end := off + length
 	firstChunk := off / meta.ChunkSize
 	lastChunk := (end - 1) / meta.ChunkSize
 	var out []SharedExtentSourceSpan
+	targetIndex := len(files) - 1
+	byFile := make([][]sharedExtentSliceSpan, len(files))
+	for i, ino := range files {
+		startChunk := uint64(0)
+		endChunk := uint64(0)
+		if i == targetIndex {
+			startChunk = firstChunk
+			endChunk = lastChunk
+		} else if lengths[i] > 0 {
+			endChunk = (lengths[i] - 1) / meta.ChunkSize
+		} else {
+			continue
+		}
+		var st syscall.Errno
+		byFile[i], st = v.sharedExtentFileSpans(ctx, ino, startChunk, endChunk)
+		if st != 0 {
+			return nil, st
+		}
+	}
 
 	for chunk := firstChunk; chunk <= lastChunk; chunk++ {
 		chunkStart := chunk * meta.ChunkSize
@@ -106,23 +128,26 @@ func (v *VFS) sharedExtentSourceSpans(ctx meta.Context, files []Ino, off, length
 			chunkStart = off
 		}
 
-		byFile := make([][]sharedExtentSliceSpan, len(files))
 		bounds := []uint64{chunkStart, chunkEnd}
-		for i, ino := range files {
-			var slices []meta.Slice
-			if st := v.Meta.Read(ctx, ino, uint32(chunk), &slices); st != 0 {
-				return nil, st
+		for _, target := range byFile[targetIndex] {
+			if target.end <= chunkStart || target.start >= chunkEnd {
+				continue
 			}
-			byFile[i] = sharedExtentSliceSpans(chunk*meta.ChunkSize, slices)
-			for _, span := range byFile[i] {
-				if span.end <= chunkStart || span.start >= chunkEnd {
-					continue
+			bounds = append(bounds, max(chunkStart, target.start), min(chunkEnd, target.end))
+			if target.id == 0 {
+				continue
+			}
+			for j := 0; j < targetIndex; j++ {
+				for _, source := range byFile[j] {
+					start, stop, ok := sharedExtentTargetIntersection(target, source)
+					if !ok || stop <= chunkStart || start >= chunkEnd {
+						continue
+					}
+					bounds = append(bounds, max(chunkStart, start), min(chunkEnd, stop))
 				}
-				bounds = append(bounds, max(chunkStart, span.start), min(chunkEnd, span.end))
 			}
 		}
 		bounds = sortedUniqueBounds(bounds)
-		targetIndex := len(files) - 1
 		for i := 0; i+1 < len(bounds); i++ {
 			start, stop := bounds[i], bounds[i+1]
 			if start == stop {
@@ -130,14 +155,17 @@ func (v *VFS) sharedExtentSourceSpans(ctx meta.Context, files []Ino, off, length
 			}
 			sourceIndex := -1
 			sourceIno := Ino(0)
+			sourceOff := uint64(0)
 			target, ok := sharedExtentSpanAt(byFile[targetIndex], start)
 			if ok && target.id != 0 {
 				sourceIndex = targetIndex
 				sourceIno = files[targetIndex]
+				sourceOff = start
 				for j := 0; j < targetIndex; j++ {
-					if source, ok := sharedExtentSpanAt(byFile[j], start); ok && sharedExtentSharedAt(target, source, start) {
+					if source, ok := sharedExtentSourceSpanAt(byFile[j], target, start); ok {
 						sourceIndex = j
 						sourceIno = files[j]
+						sourceOff = sharedExtentSourceOffset(target, source, start)
 						break
 					}
 				}
@@ -147,8 +175,21 @@ func (v *VFS) sharedExtentSourceSpans(ctx meta.Context, files []Ino, off, length
 				Len:         stop - start,
 				SourceIndex: sourceIndex,
 				SourceIno:   sourceIno,
+				SourceOff:   sourceOff,
 			})
 		}
+	}
+	return out, 0
+}
+
+func (v *VFS) sharedExtentFileSpans(ctx meta.Context, ino Ino, firstChunk, lastChunk uint64) ([]sharedExtentSliceSpan, syscall.Errno) {
+	var out []sharedExtentSliceSpan
+	for chunk := firstChunk; chunk <= lastChunk; chunk++ {
+		var slices []meta.Slice
+		if st := v.Meta.Read(ctx, ino, uint32(chunk), &slices); st != 0 {
+			return nil, st
+		}
+		out = append(out, sharedExtentSliceSpans(chunk*meta.ChunkSize, slices)...)
 	}
 	return out, 0
 }
@@ -178,8 +219,37 @@ func sharedExtentSpanAt(spans []sharedExtentSliceSpan, off uint64) (sharedExtent
 	return sharedExtentSliceSpan{}, false
 }
 
-func sharedExtentSharedAt(a, b sharedExtentSliceSpan, off uint64) bool {
-	return a.id != 0 && a.id == b.id && a.off+off-a.start == b.off+off-b.start
+func sharedExtentSourceSpanAt(spans []sharedExtentSliceSpan, target sharedExtentSliceSpan, targetOff uint64) (sharedExtentSliceSpan, bool) {
+	if target.id == 0 {
+		return sharedExtentSliceSpan{}, false
+	}
+	objectOff := target.off + targetOff - target.start
+	for _, source := range spans {
+		if source.id != target.id {
+			continue
+		}
+		if source.off <= objectOff && objectOff < source.off+source.end-source.start {
+			return source, true
+		}
+	}
+	return sharedExtentSliceSpan{}, false
+}
+
+func sharedExtentSourceOffset(target, source sharedExtentSliceSpan, targetOff uint64) uint64 {
+	objectOff := target.off + targetOff - target.start
+	return source.start + objectOff - source.off
+}
+
+func sharedExtentTargetIntersection(target, source sharedExtentSliceSpan) (uint64, uint64, bool) {
+	if target.id == 0 || target.id != source.id {
+		return 0, 0, false
+	}
+	start := max(target.off, source.off)
+	stop := min(target.off+target.end-target.start, source.off+source.end-source.start)
+	if start >= stop {
+		return 0, 0, false
+	}
+	return target.start + start - target.off, target.start + stop - target.off, true
 }
 
 func sortedUniqueBounds(bounds []uint64) []uint64 {
@@ -205,7 +275,7 @@ func appendSharedExtentSourceSpanSlice(spans *[]SharedExtentSourceSpan, span Sha
 	last := len(*spans) - 1
 	if last >= 0 {
 		prev := &(*spans)[last]
-		if prev.Off+prev.Len == span.Off && prev.SourceIndex == span.SourceIndex && prev.SourceIno == span.SourceIno {
+		if prev.Off+prev.Len == span.Off && prev.SourceIndex == span.SourceIndex && prev.SourceIno == span.SourceIno && (span.SourceIndex < 0 || prev.SourceOff+prev.Len == span.SourceOff) {
 			prev.Len += span.Len
 			return
 		}

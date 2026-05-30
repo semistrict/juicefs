@@ -28,7 +28,7 @@ func TestSharedExtentSourcesSelectsEarliestSharedSource(t *testing.T) {
 	if eno != 0 {
 		t.Fatal(eno)
 	}
-	want := []SharedExtentSourceSpan{{Off: 0, Len: 16 << 10, SourceIndex: 0, SourceIno: base}}
+	want := []SharedExtentSourceSpan{{Off: 0, Len: 16 << 10, SourceIndex: 0, SourceIno: base, SourceOff: 0}}
 	if !reflect.DeepEqual(resp.Spans, want) {
 		t.Fatalf("spans = %+v, want %+v", resp.Spans, want)
 	}
@@ -50,10 +50,10 @@ func TestSharedExtentSourcesReportsUniqueAndHoleSpans(t *testing.T) {
 		t.Fatal(eno)
 	}
 	want := []SharedExtentSourceSpan{
-		{Off: 0, Len: 4 << 10, SourceIndex: 0, SourceIno: base},
-		{Off: 4 << 10, Len: 4 << 10, SourceIndex: 1, SourceIno: target},
-		{Off: 8 << 10, Len: 8 << 10, SourceIndex: 0, SourceIno: base},
-		{Off: 16 << 10, Len: 4 << 10, SourceIndex: -1, SourceIno: 0},
+		{Off: 0, Len: 4 << 10, SourceIndex: 0, SourceIno: base, SourceOff: 0},
+		{Off: 4 << 10, Len: 4 << 10, SourceIndex: 1, SourceIno: target, SourceOff: 4 << 10},
+		{Off: 8 << 10, Len: 8 << 10, SourceIndex: 0, SourceIno: base, SourceOff: 8 << 10},
+		{Off: 16 << 10, Len: 4 << 10, SourceIndex: -1, SourceIno: 0, SourceOff: 0},
 	}
 	if !reflect.DeepEqual(resp.Spans, want) {
 		t.Fatalf("spans = %+v, want %+v", resp.Spans, want)
@@ -74,7 +74,27 @@ func TestSharedExtentSourcesSplitsAcrossChunks(t *testing.T) {
 	if eno != 0 {
 		t.Fatal(eno)
 	}
-	want := []SharedExtentSourceSpan{{Off: meta.ChunkSize - 4096, Len: 8192, SourceIndex: 0, SourceIno: base}}
+	want := []SharedExtentSourceSpan{{Off: meta.ChunkSize - 4096, Len: 8192, SourceIndex: 0, SourceIno: base, SourceOff: meta.ChunkSize - 4096}}
+	if !reflect.DeepEqual(resp.Spans, want) {
+		t.Fatalf("spans = %+v, want %+v", resp.Spans, want)
+	}
+}
+
+func TestSharedExtentSourcesReportsShiftedSourceOffset(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	base := createSharedExtentSourceFile(t, v, "base")
+	target := createSharedExtentSourceFile(t, v, "target")
+	writeSharedExtentSourceSlice(t, v, base, 0, 0, 16<<10)
+	copySharedExtentSourceRange(t, v, base, target, 0, 32<<10, 16<<10)
+
+	resp, eno := v.SharedExtentSources(meta.Background(), &SharedExtentSourcesRequest{
+		Files:  []Ino{base, target},
+		Ranges: []SharedExtentSourceRange{{Off: 36 << 10, Len: 4 << 10}},
+	})
+	if eno != 0 {
+		t.Fatal(eno)
+	}
+	want := []SharedExtentSourceSpan{{Off: 36 << 10, Len: 4 << 10, SourceIndex: 0, SourceIno: base, SourceOff: 4 << 10}}
 	if !reflect.DeepEqual(resp.Spans, want) {
 		t.Fatalf("spans = %+v, want %+v", resp.Spans, want)
 	}
@@ -114,7 +134,7 @@ func TestSharedExtentSourcesInternalControl(t *testing.T) {
 	if err := json.Unmarshal(data, &resp); err != nil {
 		t.Fatal(err)
 	}
-	want := []SharedExtentSourceSpan{{Off: 0, Len: 4096, SourceIndex: 0, SourceIno: base}}
+	want := []SharedExtentSourceSpan{{Off: 0, Len: 4096, SourceIndex: 0, SourceIno: base, SourceOff: 0}}
 	if !reflect.DeepEqual(resp.Spans, want) {
 		t.Fatalf("spans = %+v, want %+v", resp.Spans, want)
 	}
