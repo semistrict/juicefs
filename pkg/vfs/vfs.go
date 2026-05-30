@@ -145,12 +145,12 @@ type Config struct {
 	NonDefaultPermission bool              `json:",omitempty"`
 	UMask                uint16
 
-	Pid        int
-	PPid       int
-	CommPath   string       `json:",omitempty"`
-	StatePath  string       `json:",omitempty"`
-	UFFDSocket string       `json:",omitempty"`
-	FuseOpts   *FuseOptions `json:",omitempty"`
+	Pid            int
+	PPid           int
+	CommPath       string       `json:",omitempty"`
+	StatePath      string       `json:",omitempty"`
+	SmartmapSocket string       `json:",omitempty"`
+	FuseOpts       *FuseOptions `json:",omitempty"`
 
 	// the mount point for current volume (to follow symlink)
 	Mountpoint string

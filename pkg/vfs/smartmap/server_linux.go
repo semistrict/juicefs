@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-package uffd
+package smartmap
 
 /*
 #include <linux/userfaultfd.h>
@@ -46,7 +46,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path"
 	"runtime"
 	"sync"
 	"syscall"
@@ -64,7 +63,6 @@ const (
 	uffdSocketPayloadSize = 64 << 10
 	uffdHugePageSize      = 2 << 20
 
-	uffdOpServeFileCopy    = "serve_file_copy"
 	uffdOpOpenMemoryFile   = "open_memory_file"
 	uffdOpCloseMemoryFile  = "close_memory_file"
 	uffdOpServeMemoryFault = "serve_memory_faults"
@@ -148,7 +146,6 @@ type UFFDRequest struct {
 	ProbeCandidatePages int          `json:"probe_candidate_pages,omitempty"`
 	ProbeEvictPages     int          `json:"probe_evict_pages,omitempty"`
 	ProbeMonitorMillis  int          `json:"probe_monitor_millis,omitempty"`
-	Regions             []UFFDRegion `json:"regions,omitempty"`
 	Mappings            []UFFDRegion `json:"mappings,omitempty"`
 }
 
@@ -177,77 +174,38 @@ func (r UFFDRegion) fileOffset(addr uintptr) uint64 {
 	return r.Offset + uint64(addr-r.BaseHostVirtAddr)
 }
 
-func validateUFFDRegions(regions []UFFDRegion) error {
-	if len(regions) == 0 {
-		return errors.New("no uffd regions")
-	}
-	for i, r := range regions {
-		if r.BaseHostVirtAddr == 0 {
-			return fmt.Errorf("region %d has zero base_host_virt_addr", i)
-		}
-		if r.Size == 0 {
-			return fmt.Errorf("region %d has zero size", i)
-		}
-		if r.PageSize == 0 || r.PageSize&(r.PageSize-1) != 0 {
-			return fmt.Errorf("region %d has invalid page_size %d", i, r.PageSize)
-		}
-		if r.BaseHostVirtAddr%r.PageSize != 0 || r.Size%r.PageSize != 0 {
-			return fmt.Errorf("region %d is not page aligned", i)
-		}
-		if r.endHostVirtAddr() < r.BaseHostVirtAddr {
-			return fmt.Errorf("region %d overflows address space", i)
-		}
-	}
-	return nil
-}
-
 func findUFFDRegion(regions []UFFDRegion, addr uintptr) (*UFFDRegion, error) {
 	for i := range regions {
 		if regions[i].contains(addr) {
 			return &regions[i], nil
 		}
 	}
-	return nil, fmt.Errorf("fault address %d is outside uffd regions", addr)
+	return nil, fmt.Errorf("fault address %d is outside smartmap mappings", addr)
 }
 
-type uffdSession struct {
-	v       *vfs.VFS
-	ctx     vfs.LogContext
-	req     UFFDRequest
-	ino     vfs.Ino
-	fh      uint64
-	uffdFd  int
-	connFd  int
-	exitR   int
-	wakeR   int
-	wakeW   int
-	done    <-chan struct{}
-	retries []uffdPagefault
-}
-
-// Start serves UFFD requests for a mounted VFS instance on socketPath.
+// Start serves Smartmap UFFD memory requests for a mounted VFS instance on socketPath.
 func Start(v *vfs.VFS, socketPath string) (func(), error) {
 	if socketPath == "" {
 		return func() {}, nil
 	}
 	if st, err := os.Lstat(socketPath); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
-			return nil, fmt.Errorf("refusing to remove non-socket uffd path: %s", socketPath)
+			return nil, fmt.Errorf("refusing to remove non-socket smartmap path: %s", socketPath)
 		}
 		if err := os.Remove(socketPath); err != nil {
-			return nil, fmt.Errorf("remove stale uffd socket: %w", err)
+			return nil, fmt.Errorf("remove stale smartmap socket: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("inspect uffd socket path: %w", err)
+		return nil, fmt.Errorf("inspect smartmap socket path: %w", err)
 	}
 	lis, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
 	if err != nil {
-		return nil, fmt.Errorf("listen on uffd socket: %w", err)
+		return nil, fmt.Errorf("listen on smartmap socket: %w", err)
 	}
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		_ = lis.Close()
 		_ = os.Remove(socketPath)
-		return nil, fmt.Errorf("chmod uffd socket: %w", err)
+		return nil, fmt.Errorf("chmod smartmap socket: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -278,7 +236,7 @@ func Start(v *vfs.VFS, socketPath string) (func(), error) {
 				select {
 				case <-done:
 				default:
-					logger.Warnf("accept uffd socket %s: %s", socketPath, err)
+					logger.Warnf("accept smartmap socket %s: %s", socketPath, err)
 				}
 				return
 			}
@@ -305,16 +263,13 @@ func Start(v *vfs.VFS, socketPath string) (func(), error) {
 		}
 	}()
 
-	logger.Infof("serving userfaultfd requests on %s", socketPath)
+	logger.Infof("serving Smartmap userfaultfd requests on %s", socketPath)
 	return stop, nil
 }
 
 func handleUFFDConn(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache) {
 	defer conn.Close()
 	req, fds, err := readUFFDRequest(conn)
-	if err == nil && (req.Op == "" || req.Op == uffdOpServeFileCopy) {
-		err = validateUFFDRegions(req.Regions)
-	}
 	if err != nil {
 		for _, fd := range fds {
 			_ = syscall.Close(fd)
@@ -322,31 +277,7 @@ func handleUFFDConn(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache 
 		writeUFFDResponse(conn, err)
 		return
 	}
-	if req.Op != "" && req.Op != uffdOpServeFileCopy {
-		handleUFFDSharedOp(v, conn, done, cache, req, fds)
-		return
-	}
-	if len(fds) != 1 {
-		for _, fd := range fds {
-			_ = syscall.Close(fd)
-		}
-		writeUFFDResponse(conn, fmt.Errorf("expected exactly one uffd fd, got %d", len(fds)))
-		return
-	}
-	connFd, err := unixConnFD(conn)
-	if err != nil {
-		_ = syscall.Close(fds[0])
-		writeUFFDResponse(conn, err)
-		return
-	}
-
-	ctx := vfs.NewLogContext(peerMetaContext(conn))
-	s := &uffdSession{v: v, ctx: ctx, req: req, uffdFd: fds[0], connFd: connFd, done: done}
-	err = s.serve()
-	if err != nil {
-		logger.Warnf("uffd session for %s ended with error: %s", req.Path, err)
-	}
-	writeUFFDResponse(conn, err)
+	handleUFFDSharedOp(v, conn, done, cache, req, fds)
 }
 
 func readUFFDRequest(conn *net.UnixConn) (UFFDRequest, []int, error) {
@@ -354,13 +285,13 @@ func readUFFDRequest(conn *net.UnixConn) (UFFDRequest, []int, error) {
 	oob := make([]byte, syscall.CmsgSpace(uffdFdSize))
 	n, oobn, flags, _, err := conn.ReadMsgUnix(payload, oob)
 	if err != nil {
-		return UFFDRequest{}, nil, fmt.Errorf("read uffd socket message: %w", err)
+		return UFFDRequest{}, nil, fmt.Errorf("read smartmap socket message: %w", err)
 	}
 	if flags&unix.MSG_CTRUNC != 0 {
-		return UFFDRequest{}, nil, errors.New("uffd socket control message truncated")
+		return UFFDRequest{}, nil, errors.New("smartmap socket control message truncated")
 	}
 	if flags&unix.MSG_TRUNC != 0 {
-		return UFFDRequest{}, nil, errors.New("uffd socket payload truncated")
+		return UFFDRequest{}, nil, errors.New("smartmap socket payload truncated")
 	}
 	var req UFFDRequest
 	if err := json.Unmarshal(payload[:n], &req); err != nil {
@@ -419,140 +350,15 @@ func peerMetaContext(conn *net.UnixConn) meta.Context {
 func unixConnFD(conn *net.UnixConn) (int, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
-		return -1, fmt.Errorf("get uffd socket fd: %w", err)
+		return -1, fmt.Errorf("get smartmap socket fd: %w", err)
 	}
 	connFd := -1
 	if err := raw.Control(func(fd uintptr) {
 		connFd = int(fd)
 	}); err != nil {
-		return -1, fmt.Errorf("inspect uffd socket fd: %w", err)
+		return -1, fmt.Errorf("inspect smartmap socket fd: %w", err)
 	}
 	return connFd, nil
-}
-
-func (s *uffdSession) serve() error {
-	if err := s.openFile(); err != nil {
-		_ = syscall.Close(s.uffdFd)
-		return err
-	}
-	defer s.v.Release(s.ctx, s.ino, s.fh)
-	defer syscall.Close(s.uffdFd)
-
-	exitPipe := [2]int{}
-	if err := syscall.Pipe2(exitPipe[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
-		return fmt.Errorf("create uffd exit pipe: %w", err)
-	}
-	defer syscall.Close(exitPipe[0])
-	defer syscall.Close(exitPipe[1])
-	s.exitR = exitPipe[0]
-	exitW := exitPipe[1]
-
-	wakePipe := [2]int{}
-	if err := syscall.Pipe2(wakePipe[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
-		return fmt.Errorf("create uffd wake pipe: %w", err)
-	}
-	defer syscall.Close(wakePipe[0])
-	defer syscall.Close(wakePipe[1])
-	s.wakeR, s.wakeW = wakePipe[0], wakePipe[1]
-
-	if s.done != nil {
-		sessionDone := make(chan struct{})
-		defer close(sessionDone)
-		go func() {
-			select {
-			case <-s.done:
-				_, _ = syscall.Write(exitW, []byte{1})
-			case <-sessionDone:
-			}
-		}()
-	}
-
-	return s.poll()
-}
-
-func (s *uffdSession) openFile() error {
-	if s.req.Path == "" {
-		return errors.New("uffd request path is empty")
-	}
-	var ino vfs.Ino
-	attr := &vfs.Attr{}
-	p := path.Clean(s.req.Path)
-	if !path.IsAbs(p) {
-		return fmt.Errorf("uffd request path must be absolute: %s", s.req.Path)
-	}
-	if st := s.v.Meta.Resolve(s.ctx, meta.RootInode, p, &ino, attr, true); st != 0 {
-		return fmt.Errorf("resolve %s: %w", p, st)
-	}
-	if attr.Typ != meta.TypeFile {
-		return fmt.Errorf("uffd request path is not a file: %s", p)
-	}
-	entry, fh, st := s.v.Open(s.ctx, ino, syscall.O_RDONLY)
-	if st != 0 {
-		return fmt.Errorf("open %s: %w", p, st)
-	}
-	s.ino, s.fh = entry.Inode, fh
-	return nil
-}
-
-func (s *uffdSession) poll() error {
-	pollFds := []unix.PollFd{
-		{Fd: int32(s.uffdFd), Events: unix.POLLIN},
-		{Fd: int32(s.exitR), Events: unix.POLLIN},
-		{Fd: int32(s.wakeR), Events: unix.POLLIN},
-		{Fd: int32(s.connFd), Events: unix.POLLIN},
-	}
-	for {
-		if _, err := unix.Poll(pollFds, -1); err != nil {
-			if err == unix.EINTR || err == unix.EAGAIN {
-				continue
-			}
-			return fmt.Errorf("poll uffd: %w", err)
-		}
-		if hasPollEvent(pollFds[1].Revents, unix.POLLIN) {
-			return nil
-		}
-		if hasPollEvent(pollFds[2].Revents, unix.POLLIN) {
-			drainFd(s.wakeR)
-		}
-		if hasPollEvent(pollFds[3].Revents, unix.POLLERR|unix.POLLNVAL) {
-			return fmt.Errorf("uffd request socket poll error: revents=%#x", pollFds[3].Revents)
-		}
-		if hasPollEvent(pollFds[3].Revents, unix.POLLHUP) {
-			return nil
-		}
-		if hasPollEvent(pollFds[3].Revents, unix.POLLIN) {
-			closed, err := socketClosed(s.connFd)
-			if err != nil {
-				return err
-			}
-			if closed {
-				return nil
-			}
-		}
-		if hasPollEvent(pollFds[0].Revents, unix.POLLHUP) {
-			return nil
-		}
-		if hasPollEvent(pollFds[0].Revents, unix.POLLERR|unix.POLLNVAL) {
-			return fmt.Errorf("uffd poll error: revents=%#x", pollFds[0].Revents)
-		}
-		var faults []uffdPagefault
-		if hasPollEvent(pollFds[0].Revents, unix.POLLIN) {
-			readFaults, err := readUFFDFaults(s.uffdFd)
-			if err != nil {
-				return err
-			}
-			faults = append(faults, readFaults...)
-		}
-		if len(s.retries) > 0 {
-			faults = append(s.retries, faults...)
-			s.retries = nil
-		}
-		for i := range faults {
-			if err := s.handleFault(&faults[i]); err != nil {
-				return err
-			}
-		}
-	}
 }
 
 func readUFFDFaults(fd int) ([]uffdPagefault, error) {
@@ -580,54 +386,6 @@ func readUFFDFaults(fd int) ([]uffdPagefault, error) {
 		arg := msg.arg
 		faults = append(faults, *(*uffdPagefault)(unsafe.Pointer(&arg[0])))
 	}
-}
-
-func (s *uffdSession) handleFault(pf *uffdPagefault) error {
-	if pf.flags&uffdPagefaultFlagMinor != 0 {
-		return errors.New("unsupported uffd MINOR page fault")
-	}
-	if pf.flags&uffdPagefaultFlagWP != 0 {
-		return errors.New("unsupported uffd WP page fault")
-	}
-	addr := uintptr(pf.address)
-	region, err := findUFFDRegion(s.req.Regions, addr)
-	if err != nil {
-		return err
-	}
-	pageAddr := addr & ^(region.PageSize - 1)
-	off := region.fileOffset(pageAddr)
-	buf := make([]byte, region.PageSize)
-	if err := s.readPage(buf, off); err != nil {
-		return err
-	}
-	err = uffdCopy(s.uffdFd, pageAddr, region.PageSize, buf)
-	if errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ESRCH) {
-		return nil
-	}
-	if errors.Is(err, unix.EAGAIN) {
-		s.retries = append(s.retries, *pf)
-		s.signalWake()
-		return nil
-	}
-	return err
-}
-
-func (s *uffdSession) readPage(buf []byte, off uint64) error {
-	for read := 0; read < len(buf); {
-		n, st := s.v.Read(s.ctx, s.ino, buf[read:], off+uint64(read), s.fh)
-		if st != 0 {
-			return fmt.Errorf("read page at %d: %w", off+uint64(read), st)
-		}
-		if n == 0 {
-			break
-		}
-		read += n
-	}
-	return nil
-}
-
-func uffdCopy(fd int, addr, pageSize uintptr, data []byte) error {
-	return uffdCopyMode(fd, addr, pageSize, data, 0)
 }
 
 func uffdCopyMode(fd int, addr, pageSize uintptr, data []byte, mode uint64) error {
@@ -739,8 +497,4 @@ func socketClosed(fd int) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("peek uffd request socket: %w", err)
-}
-
-func (s *uffdSession) signalWake() {
-	_, _ = syscall.Write(s.wakeW, []byte{1})
 }

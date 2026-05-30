@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-package uffd
+package smartmap
 
 // Control messages are exchanged as JSON on the serve_memory_faults UDS
 // connection after the initial SCM_RIGHTS handoff.

@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 
-package uffd
+package smartmap
 
 import (
 	"fmt"

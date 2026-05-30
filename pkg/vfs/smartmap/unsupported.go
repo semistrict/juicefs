@@ -1,3 +1,6 @@
+//go:build !linux || !cgo
+// +build !linux !cgo
+
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -14,9 +17,14 @@
  * limitations under the License.
  */
 
-// Package uffd serves Linux userfaultfd requests for mounted JuiceFS VFS instances.
-//
-// The package lives under pkg/vfs so it can use the exported VFS API while
-// keeping userfaultfd-specific state and protocol handling out of the core VFS
-// package.
-package uffd
+package smartmap
+
+import (
+	"fmt"
+
+	"github.com/juicedata/juicefs/pkg/vfs"
+)
+
+func Start(_ *vfs.VFS, socketPath string) (func(), error) {
+	return nil, fmt.Errorf("smartmap socket is only supported on Linux")
+}

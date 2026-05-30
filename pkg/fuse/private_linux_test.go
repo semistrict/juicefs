@@ -44,7 +44,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
-	"github.com/juicedata/juicefs/pkg/vfs/uffd"
+	"github.com/juicedata/juicefs/pkg/vfs/smartmap"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -151,10 +151,10 @@ type fuseUFFDClientResult struct {
 }
 
 type fuseUFFDResponse struct {
-	OK       bool              `json:"ok"`
-	Error    string            `json:"error,omitempty"`
-	MemoryID string            `json:"memory_id,omitempty"`
-	Extents  []uffd.UFFDExtent `json:"extents,omitempty"`
+	OK       bool                  `json:"ok"`
+	Error    string                `json:"error,omitempty"`
+	MemoryID string                `json:"memory_id,omitempty"`
+	Extents  []smartmap.UFFDExtent `json:"extents,omitempty"`
 }
 
 type fuseUFFDControlRange struct {
@@ -180,7 +180,7 @@ type fuseUFFDControlAck struct {
 type fuseUFFDOpenedMemory struct {
 	fd       int
 	memoryID string
-	extents  []uffd.UFFDExtent
+	extents  []smartmap.UFFDExtent
 }
 
 type fuseUFFDClientState struct {
@@ -201,7 +201,7 @@ func TestUFFDPrivatePeriodicWritebackThroughMountedFuse(t *testing.T) {
 	metaPath := filepath.Join(tmp, "meta.db")
 	metaURL := "sqlite3://" + metaPath
 	mp := filepath.Join(tmp, "mp")
-	sock := filepath.Join(tmp, "uffd.sock")
+	sock := filepath.Join(tmp, "smartmap.sock")
 	require.NoError(t, setUpWithUFFD(metaURL, mp, sock))
 	defer umount(mp, true)
 
@@ -415,7 +415,7 @@ func setUpWithUFFD(metaURL, mp, sock string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("wait for uffd socket %s: %w", sock, err)
+			return fmt.Errorf("wait for smartmap socket %s: %w", sock, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -426,7 +426,7 @@ func setupFuseUFFDMount(t testing.TB, tmp string) (string, string) {
 	metaPath := filepath.Join(tmp, "meta.db")
 	metaURL := "sqlite3://" + metaPath
 	mp := filepath.Join(tmp, "mp")
-	sock := filepath.Join(tmp, "uffd.sock")
+	sock := filepath.Join(tmp, "smartmap.sock")
 	require.NoError(t, setUpWithUFFD(metaURL, mp, sock))
 	t.Cleanup(func() { umount(mp, true) })
 	return mp, sock
@@ -479,9 +479,9 @@ func mountWithUFFD(url, mp, sock string) {
 	conf.DirEntryTimeout = time.Second
 	conf.HideInternal = true
 	jfs := vfs.NewVFS(conf, m, store, nil, nil)
-	stopUFFD, err := uffd.Start(jfs, sock)
+	stopUFFD, err := smartmap.Start(jfs, sock)
 	if err != nil {
-		log.Fatalf("uffd socket: %s", err)
+		log.Fatalf("smartmap socket: %s", err)
 	}
 	defer stopUFFD()
 	if err = Serve(jfs, "", true, true); err != nil {
@@ -694,7 +694,7 @@ func fuseUFFDOpenMemory(sock, path string, size uint64) (fuseUFFDOpenedMemory, s
 		return fuseUFFDOpenedMemory{}, "", err
 	}
 	defer conn.Close()
-	req := uffd.UFFDRequest{Op: fuseUFFDOpOpenMemoryFile, Path: path, Size: size}
+	req := smartmap.UFFDRequest{Op: fuseUFFDOpOpenMemoryFile, Path: path, Size: size}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return fuseUFFDOpenedMemory{}, "", err
@@ -733,7 +733,7 @@ func closeFuseUFFDMemoryForTest(t testing.TB, sock string, opened fuseUFFDOpened
 	require.NoError(t, unix.Close(opened.fd))
 }
 
-func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []uffd.UFFDExtent, off uint64) uint64 {
+func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []smartmap.UFFDExtent, off uint64) uint64 {
 	t.Helper()
 	for _, extent := range extents {
 		if off >= extent.FileOffset && off < extent.FileOffset+extent.Length {
@@ -766,7 +766,7 @@ func fuseUFFDCloseMemoryOnce(sock, memoryID string) error {
 		return err
 	}
 	defer conn.Close()
-	req := uffd.UFFDRequest{Op: fuseUFFDOpCloseMemoryFile, MemoryID: memoryID}
+	req := smartmap.UFFDRequest{Op: fuseUFFDOpCloseMemoryFile, MemoryID: memoryID}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -789,11 +789,11 @@ func fuseUFFDServeMemory(sock string, uffdFD int, memoryID string, maxResidentPa
 	if err != nil {
 		return nil, err
 	}
-	req := uffd.UFFDRequest{
+	req := smartmap.UFFDRequest{
 		Op:               fuseUFFDOpServeMemoryFault,
 		MemoryID:         memoryID,
 		MaxResidentPages: maxResidentPages,
-		Mappings: []uffd.UFFDRegion{{
+		Mappings: []smartmap.UFFDRegion{{
 			BaseHostVirtAddr: uintptr(unsafe.Pointer(&mapped[0])),
 			Size:             uintptr(len(mapped)),
 			Offset:           0,
@@ -848,7 +848,7 @@ func closeFuseUFFDFDs(fds []int) {
 	}
 }
 
-func fuseUFFDMapPrivate(fd int, size uint64, extents []uffd.UFFDExtent) ([]byte, func(), string, error) {
+func fuseUFFDMapPrivate(fd int, size uint64, extents []smartmap.UFFDExtent) ([]byte, func(), string, error) {
 	reserve, err := unix.Mmap(-1, 0, int(size+fuseUFFDHugePageSize), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
 	if err != nil {
 		return nil, nil, fuseUFFDHugeTLBUnavailableReason(err), err

@@ -53,7 +53,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
-	"github.com/juicedata/juicefs/pkg/vfs/uffd"
+	"github.com/juicedata/juicefs/pkg/vfs/smartmap"
 )
 
 var mountPid int
@@ -497,8 +497,8 @@ func mountFlags() []cli.Flag {
 			Usage: "disable transparent huge page to avoid latency spikes caused by kernel's memory compaction",
 		})
 		selfFlags = append(selfFlags, &cli.StringFlag{
-			Name:  "uffd-socket",
-			Usage: "Unix socket path for serving userfaultfd missing-page faults",
+			Name:  "smartmap-socket",
+			Usage: "Unix socket path for Smartmap shared memory",
 		})
 	}
 	return append(selfFlags, fuseFlags()...)
@@ -1142,7 +1142,7 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
 	if runtime.GOOS == "linux" {
-		conf.UFFDSocket = c.String("uffd-socket")
+		conf.SmartmapSocket = c.String("smartmap-socket")
 	}
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
@@ -1161,10 +1161,10 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		}
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
-	if conf.UFFDSocket != "" {
-		stopUFFD, err := uffd.Start(v, conf.UFFDSocket)
+	if conf.SmartmapSocket != "" {
+		stopUFFD, err := smartmap.Start(v, conf.SmartmapSocket)
 		if err != nil {
-			logger.Fatalf("uffd socket: %s", err)
+			logger.Fatalf("smartmap socket: %s", err)
 		}
 		defer stopUFFD()
 	}

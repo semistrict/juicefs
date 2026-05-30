@@ -1,6 +1,3 @@
-//go:build !linux || !cgo
-// +build !linux !cgo
-
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -17,14 +14,12 @@
  * limitations under the License.
  */
 
-package uffd
-
-import (
-	"fmt"
-
-	"github.com/juicedata/juicefs/pkg/vfs"
-)
-
-func Start(_ *vfs.VFS, socketPath string) (func(), error) {
-	return nil, fmt.Errorf("userfaultfd socket is only supported on Linux")
-}
+// Package smartmap serves Linux Smartmap requests for mounted JuiceFS VFS
+// instances.
+//
+// The package lives under pkg/vfs so it can use the exported VFS API while
+// keeping userfaultfd-specific state and protocol handling out of the core VFS
+// package. It is an efficient replacement for naive mmap VM memory: clients
+// still see one contiguous file mapping, but cloned JuiceFS files can share
+// clean pages instead of duplicating bytes per mapping.
+package smartmap
