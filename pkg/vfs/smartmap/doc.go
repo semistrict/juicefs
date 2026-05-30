@@ -23,3 +23,12 @@
 // still see one contiguous file mapping, but cloned JuiceFS files can share
 // clean pages instead of duplicating bytes per mapping.
 package smartmap
+
+type Options struct {
+	ResidentSize uint64
+
+	EvictionPolicy      string
+	ProbeCandidatePages int
+	ProbeEvictPages     int
+	ProbeMonitorMillis  int
+}

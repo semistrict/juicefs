@@ -15,6 +15,11 @@ cmd/cmd
 .hypothesis
 /node_modules
 
+# Rust SDK build artifacts
+sdk/rust/smartmap/target/
+sdk/rust/smartmap/target
+sdk/rust/smartmap/Cargo.lock
+
 # os
 .DS_Store
 

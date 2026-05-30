@@ -41,18 +41,31 @@ var uffdPagePool = sync.Pool{New: func() any { return make([]byte, uffdHugePageS
 const uffdRefaultProtectionMultiplier = 2
 
 type uffdSharedCache struct {
-	mu       sync.Mutex
-	fd       int
-	mapped   []byte
-	next     uint64
-	seq      uint64
-	free     []uint64
-	resident int
-	clock    uint64
-	control  uint64
-	probe    uint64
-	pages    map[string]*uffdSharedPage
-	memories map[string]*uffdMemory
+	mu                  sync.Mutex
+	fd                  int
+	mapped              []byte
+	next                uint64
+	seq                 uint64
+	free                []uint64
+	resident            int
+	maxResidentPages    int
+	evictionPolicy      string
+	probeCandidatePages int
+	probeEvictPages     int
+	probeMonitorMillis  int
+	clock               uint64
+	control             uint64
+	probe               uint64
+	pages               map[string]*uffdSharedPage
+	memories            map[string]*uffdMemory
+}
+
+type uffdSharedCacheOptions struct {
+	maxResidentPages    int
+	evictionPolicy      string
+	probeCandidatePages int
+	probeEvictPages     int
+	probeMonitorMillis  int
 }
 
 type uffdSharedPage struct {
@@ -117,11 +130,20 @@ type uffdProbeConfig struct {
 	monitor    time.Duration
 }
 
-func newUFFDSharedCache() *uffdSharedCache {
+func newUFFDSharedCache(options ...uffdSharedCacheOptions) *uffdSharedCache {
+	var opt uffdSharedCacheOptions
+	if len(options) > 0 {
+		opt = options[0]
+	}
 	return &uffdSharedCache{
-		fd:       -1,
-		pages:    make(map[string]*uffdSharedPage),
-		memories: make(map[string]*uffdMemory),
+		fd:                  -1,
+		maxResidentPages:    opt.maxResidentPages,
+		evictionPolicy:      opt.evictionPolicy,
+		probeCandidatePages: opt.probeCandidatePages,
+		probeEvictPages:     opt.probeEvictPages,
+		probeMonitorMillis:  opt.probeMonitorMillis,
+		pages:               make(map[string]*uffdSharedPage),
+		memories:            make(map[string]*uffdMemory),
 	}
 }
 
@@ -180,11 +202,6 @@ func handleUFFDSharedOp(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, ca
 			writeUFFDResponse(conn, err)
 			return
 		}
-		if err := validateUFFDSharedEviction(req); err != nil {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, err)
-			return
-		}
 		memory, err := cache.memory(req.MemoryID)
 		if err != nil {
 			closeUFFDSharedFDs(fds)
@@ -237,27 +254,6 @@ func validateUFFDSharedMappings(mappings []UFFDRegion) error {
 		if r.endHostVirtAddr() < r.BaseHostVirtAddr {
 			return fmt.Errorf("mapping %d overflows address space", i)
 		}
-	}
-	return nil
-}
-
-func validateUFFDSharedEviction(req UFFDRequest) error {
-	switch req.EvictionPolicy {
-	case "", "lru", uffdEvictionPolicyProbe:
-	default:
-		return fmt.Errorf("unsupported uffd eviction_policy: %s", req.EvictionPolicy)
-	}
-	if req.ProbeCandidatePages < 0 {
-		return fmt.Errorf("probe_candidate_pages must be non-negative, got %d", req.ProbeCandidatePages)
-	}
-	if req.ProbeEvictPages < 0 {
-		return fmt.Errorf("probe_evict_pages must be non-negative, got %d", req.ProbeEvictPages)
-	}
-	if req.ProbeMonitorMillis < 0 {
-		return fmt.Errorf("probe_monitor_millis must be non-negative, got %d", req.ProbeMonitorMillis)
-	}
-	if req.EvictionPolicy == uffdEvictionPolicyProbe && req.MaxResidentPages <= 0 {
-		return errors.New("probe eviction requires max_resident_pages")
 	}
 	return nil
 }
@@ -798,15 +794,16 @@ func (s *uffdSharedSession) populatePage(page *uffdSharedPage) error {
 }
 
 func (s *uffdSharedSession) markRefaultProtectionLocked(page *uffdSharedPage) {
-	if s.req.MaxResidentPages <= 0 || page.evictedAt == 0 {
+	limit := s.cache.maxResidentPages
+	if limit <= 0 || page.evictedAt == 0 {
 		return
 	}
-	refaultWindow := uint64(s.req.MaxResidentPages)
+	refaultWindow := uint64(limit)
 	if s.cache.clock < page.evictedAt || s.cache.clock-page.evictedAt > refaultWindow {
 		page.evictedAt = 0
 		return
 	}
-	protectFor := uint64(s.req.MaxResidentPages * uffdRefaultProtectionMultiplier)
+	protectFor := uint64(limit * uffdRefaultProtectionMultiplier)
 	if protectFor == 0 {
 		protectFor = 1
 	}
@@ -826,12 +823,13 @@ func (s *uffdSharedSession) finishPageLoad(page *uffdSharedPage, err error) {
 }
 
 func (s *uffdSharedSession) ensureResidentCapacity(skip *uffdSharedPage) error {
-	if s.req.MaxResidentPages <= 0 {
+	limit := s.cache.maxResidentPages
+	if limit <= 0 {
 		return nil
 	}
 	for {
 		if s.probeEvictionEnabled() {
-			victim, targets := s.cache.reserveProbeColdVictim(skip, s.req.MaxResidentPages)
+			victim, targets := s.cache.reserveProbeColdVictim(skip, limit)
 			if victim != nil {
 				if err := s.evictReservedPage(victim, targets); err != nil {
 					return err
@@ -839,7 +837,7 @@ func (s *uffdSharedSession) ensureResidentCapacity(skip *uffdSharedPage) error {
 				continue
 			}
 		}
-		victim, targets := s.cache.reserveEvictionVictim(skip, s.req.MaxResidentPages)
+		victim, targets := s.cache.reserveEvictionVictim(skip, limit)
 		if victim == nil {
 			return nil
 		}
@@ -860,7 +858,7 @@ func (c *uffdSharedCache) reserveProbeColdVictim(skip *uffdSharedPage, limit int
 		if page == skip || !page.populated || page.loading || page.evicting || page.probing || !page.probeCold || page.probeHit || c.refaultProtectedLocked(page) {
 			continue
 		}
-		if victim == nil || page.lastUsed < victim.lastUsed {
+		if c.betterEvictionVictimLocked(page, victim) {
 			victim = page
 		}
 	}
@@ -882,7 +880,7 @@ func (c *uffdSharedCache) reserveEvictionVictim(skip *uffdSharedPage, limit int)
 		if page == skip || !page.populated || page.loading || page.evicting || page.probing || c.refaultProtectedLocked(page) {
 			continue
 		}
-		if victim == nil || page.lastUsed < victim.lastUsed {
+		if c.betterEvictionVictimLocked(page, victim) {
 			victim = page
 		}
 	}
@@ -891,7 +889,7 @@ func (c *uffdSharedCache) reserveEvictionVictim(skip *uffdSharedPage, limit int)
 			if page == skip || !page.populated || page.loading || page.evicting {
 				continue
 			}
-			if victim == nil || page.lastUsed < victim.lastUsed {
+			if c.betterEvictionVictimLocked(page, victim) {
 				victim = page
 			}
 		}
@@ -901,6 +899,31 @@ func (c *uffdSharedCache) reserveEvictionVictim(skip *uffdSharedPage, limit int)
 	}
 	victim.evicting = true
 	return victim, c.evictionTargetsLocked(victim)
+}
+
+func (c *uffdSharedCache) betterEvictionVictimLocked(page, victim *uffdSharedPage) bool {
+	if victim == nil {
+		return true
+	}
+	pageMappings := c.activeMappingCountLocked(page)
+	victimMappings := c.activeMappingCountLocked(victim)
+	if pageMappings != victimMappings {
+		return pageMappings < victimMappings
+	}
+	return page.lastUsed < victim.lastUsed
+}
+
+func (c *uffdSharedCache) activeMappingCountLocked(page *uffdSharedPage) int {
+	mappings := 0
+	for _, memory := range c.memories {
+		for _, memoryPage := range memory.pages {
+			if memoryPage != page {
+				continue
+			}
+			mappings += len(memory.active)
+		}
+	}
+	return mappings
 }
 
 func (c *uffdSharedCache) evictionTargetsLocked(page *uffdSharedPage) []uffdEvictionTarget {
@@ -961,24 +984,25 @@ func (s *uffdSharedSession) maybeStartProbeRound(skip *uffdSharedPage) error {
 }
 
 func (s *uffdSharedSession) probeEvictionEnabled() bool {
-	return s.req.EvictionPolicy == uffdEvictionPolicyProbe
+	return s.cache.evictionPolicy == uffdEvictionPolicyProbe
 }
 
 func (s *uffdSharedSession) probeConfig() (uffdProbeConfig, bool) {
-	if !s.probeEvictionEnabled() || s.req.MaxResidentPages <= 0 {
+	limit := s.cache.maxResidentPages
+	if !s.probeEvictionEnabled() || limit <= 0 {
 		return uffdProbeConfig{}, false
 	}
-	candidates := s.req.ProbeCandidatePages
+	candidates := s.cache.probeCandidatePages
 	if candidates <= 0 {
-		candidates = s.req.MaxResidentPages / 2
+		candidates = limit / 2
 	}
 	if candidates <= 0 {
 		candidates = 1
 	}
-	if candidates > s.req.MaxResidentPages {
-		candidates = s.req.MaxResidentPages
+	if candidates > limit {
+		candidates = limit
 	}
-	evict := s.req.ProbeEvictPages
+	evict := s.cache.probeEvictPages
 	if evict <= 0 {
 		evict = candidates / 2
 	}
@@ -988,11 +1012,11 @@ func (s *uffdSharedSession) probeConfig() (uffdProbeConfig, bool) {
 	if evict > candidates {
 		evict = candidates
 	}
-	monitorMillis := s.req.ProbeMonitorMillis
+	monitorMillis := s.cache.probeMonitorMillis
 	if monitorMillis <= 0 {
 		monitorMillis = 10
 	}
-	threshold := s.req.MaxResidentPages - evict
+	threshold := limit - evict
 	if threshold < 1 {
 		threshold = 1
 	}

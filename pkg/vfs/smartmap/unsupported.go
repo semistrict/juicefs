@@ -26,5 +26,9 @@ import (
 )
 
 func Start(_ *vfs.VFS, socketPath string) (func(), error) {
+	return StartWithOptions(nil, socketPath, Options{})
+}
+
+func StartWithOptions(_ *vfs.VFS, socketPath string, options Options) (func(), error) {
 	return nil, fmt.Errorf("smartmap socket is only supported on Linux")
 }

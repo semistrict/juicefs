@@ -500,6 +500,10 @@ func mountFlags() []cli.Flag {
 			Name:  "smartmap-socket",
 			Usage: "Unix socket path for Smartmap shared memory",
 		})
+		selfFlags = append(selfFlags, &cli.StringFlag{
+			Name:  "smartmap-resident-size",
+			Usage: "max resident Smartmap clean page memory",
+		})
 	}
 	return append(selfFlags, fuseFlags()...)
 }
@@ -1143,6 +1147,7 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
 	if runtime.GOOS == "linux" {
 		conf.SmartmapSocket = c.String("smartmap-socket")
+		conf.SmartmapResidentSize = utils.ParseBytes(c, "smartmap-resident-size", 'B')
 	}
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
@@ -1162,7 +1167,9 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
 	if conf.SmartmapSocket != "" {
-		stopUFFD, err := smartmap.Start(v, conf.SmartmapSocket)
+		stopUFFD, err := smartmap.StartWithOptions(v, conf.SmartmapSocket, smartmap.Options{
+			ResidentSize: conf.SmartmapResidentSize,
+		})
 		if err != nil {
 			logger.Fatalf("smartmap socket: %s", err)
 		}

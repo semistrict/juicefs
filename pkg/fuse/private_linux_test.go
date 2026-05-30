@@ -33,7 +33,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -50,57 +49,24 @@ import (
 )
 
 const (
-	fuseUFFDHelperEnv      = "JUICEFS_FUSE_UFFD_HELPER"
-	fuseUFFDHugePageSize   = 2 << 20
-	fuseUFFDPayloadSize    = 64 << 10
-	fuseUFFDSharedMemoryFD = 3
-
-	fuseUFFDOpOpenMemoryFile   = "open_memory_file"
-	fuseUFFDOpCloseMemoryFile  = "close_memory_file"
-	fuseUFFDOpServeMemoryFault = "serve_memory_faults"
-	fuseUFFDControlEvict       = "evict"
-	fuseUFFDControlEvictAck    = "evict_ack"
-	fuseUFFDControlProbe       = "probe"
-	fuseUFFDControlProbeAck    = "probe_ack"
+	fuseUFFDHelperEnv    = "JUICEFS_FUSE_UFFD_HELPER"
+	fuseUFFDHugePageSize = 2 << 20
 
 	fuseUFFDPagemapEntrySize  = 8
 	fuseUFFDPagemapPresentBit = uint64(1) << 63
 	fuseUFFDPagemapWPBit      = uint64(1) << 57
 
-	fuseUFFDAPI = 0xAA
-
-	fuseUFFDFeatureMissingHugetlbfs = 1 << 4
-	fuseUFFDFeatureMinorHugetlbfs   = 1 << 9
-	fuseUFFDFeatureWPAsync          = 1 << 15
-
-	fuseUFFDIORegisterModeMissing  = 1 << 0
-	fuseUFFDIORegisterModeWP       = 1 << 1
-	fuseUFFDIORegisterModeMinor    = 1 << 2
-	fuseUFFDIOWriteProtectModeWP   = 1 << 0
-	fuseUFFDUnavailableSkipMessage = "userfaultfd unavailable under this kernel policy or feature set"
+	fuseUFFDAPI                  = 0xAA
+	fuseUFFDIOWriteProtectModeWP = 1 << 0
 )
 
 var (
-	fuseUFFDIOAPIIoctl          = fuseUFFDIOWR(0x3F, unsafe.Sizeof(fuseUFFDIOAPI{}))
-	fuseUFFDIORegisterIoctl     = fuseUFFDIOWR(0x00, unsafe.Sizeof(fuseUFFDIORegister{}))
 	fuseUFFDIOWriteProtectIoctl = fuseUFFDIOWR(0x06, unsafe.Sizeof(fuseUFFDIOWriteProtect{}))
 )
-
-type fuseUFFDIOAPI struct {
-	api      uint64
-	features uint64
-	ioctls   uint64
-}
 
 type fuseUFFDIORange struct {
 	start uint64
 	len   uint64
-}
-
-type fuseUFFDIORegister struct {
-	rng    fuseUFFDIORange
-	mode   uint64
-	ioctls uint64
 }
 
 type fuseUFFDIOWriteProtect struct {
@@ -131,7 +97,6 @@ type fuseUFFDClientScript struct {
 	Path                string                 `json:"path"`
 	WritebackPath       string                 `json:"writeback_path"`
 	Size                uint64                 `json:"size"`
-	MaxResidentPages    int                    `json:"max_resident_pages"`
 	FlushIntervalMillis int                    `json:"flush_interval_millis,omitempty"`
 	Actions             []fuseUFFDClientAction `json:"actions"`
 }
@@ -150,13 +115,6 @@ type fuseUFFDClientResult struct {
 	Skip  string `json:"skip,omitempty"`
 }
 
-type fuseUFFDResponse struct {
-	OK       bool                  `json:"ok"`
-	Error    string                `json:"error,omitempty"`
-	MemoryID string                `json:"memory_id,omitempty"`
-	Extents  []smartmap.UFFDExtent `json:"extents,omitempty"`
-}
-
 type fuseUFFDControlRange struct {
 	FileOffset uint64 `json:"file_offset"`
 	Length     uint64 `json:"length"`
@@ -170,26 +128,21 @@ type fuseUFFDControlMessage struct {
 	Ranges    []fuseUFFDControlRange `json:"ranges,omitempty"`
 }
 
-type fuseUFFDControlAck struct {
-	Type      string `json:"type"`
-	RequestID uint64 `json:"request_id"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-}
-
 type fuseUFFDOpenedMemory struct {
-	fd       int
-	memoryID string
-	extents  []smartmap.UFFDExtent
+	client  *smartmap.RustClient
+	extents []smartmap.UFFDExtent
 }
 
 type fuseUFFDClientState struct {
 	mapped    []byte
-	conn      *net.UnixConn
 	uffdFD    int
 	baseAddr  uintptr
 	writeback string
 	evictions chan fuseUFFDControlMessage
+}
+
+type fuseRustSmartmapControlHandler struct {
+	state *fuseUFFDClientState
 }
 
 func TestUFFDPrivatePeriodicWritebackThroughMountedFuse(t *testing.T) {
@@ -361,18 +314,17 @@ func TestUFFDEvictionFlushesDirtyPrivatePageBeforeDropThroughMountedFuse(t *test
 	}
 
 	tmp := t.TempDir()
-	mp, sock := setupFuseUFFDMount(t, tmp)
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{ResidentSize: fuseUFFDHugePageSize})
 	const memorySize = 2 * fuseUFFDHugePageSize
 	memoryPath := filepath.Join(mp, "vm-memory")
 	writeFuseUFFDFile(t, memoryPath, memorySize)
 
 	const privateByte = 0xc7
 	result := runFuseUFFDClient(t, fuseUFFDClientScript{
-		Sock:             sock,
-		Path:             "/vm-memory",
-		WritebackPath:    memoryPath,
-		Size:             memorySize,
-		MaxResidentPages: 1,
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		Size:          memorySize,
 		Actions: []fuseUFFDClientAction{
 			{Op: "read", Offset: 17, Want: fuseUFFDDeterministicByte(17)},
 			{Op: "write", Offset: 0, Value: privateByte},
@@ -402,8 +354,12 @@ func TestFUSEUFFDClientHelperProcess(t *testing.T) {
 }
 
 func setUpWithUFFD(metaURL, mp, sock string) error {
+	return setUpWithUFFDOptions(metaURL, mp, sock, smartmap.Options{})
+}
+
+func setUpWithUFFDOptions(metaURL, mp, sock string, options smartmap.Options) error {
 	format(metaURL)
-	go mountWithUFFD(metaURL, mp, sock)
+	go mountWithUFFD(metaURL, mp, sock, options)
 	if err := <-waitMountpoint(mp); err != nil {
 		return err
 	}
@@ -422,17 +378,21 @@ func setUpWithUFFD(metaURL, mp, sock string) error {
 }
 
 func setupFuseUFFDMount(t testing.TB, tmp string) (string, string) {
+	return setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+}
+
+func setupFuseUFFDMountWithOptions(t testing.TB, tmp string, options smartmap.Options) (string, string) {
 	t.Helper()
 	metaPath := filepath.Join(tmp, "meta.db")
 	metaURL := "sqlite3://" + metaPath
 	mp := filepath.Join(tmp, "mp")
 	sock := filepath.Join(tmp, "smartmap.sock")
-	require.NoError(t, setUpWithUFFD(metaURL, mp, sock))
+	require.NoError(t, setUpWithUFFDOptions(metaURL, mp, sock, options))
 	t.Cleanup(func() { umount(mp, true) })
 	return mp, sock
 }
 
-func mountWithUFFD(url, mp, sock string) {
+func mountWithUFFD(url, mp, sock string, options smartmap.Options) {
 	if err := os.MkdirAll(mp, 0777); err != nil {
 		log.Fatalf("create %s: %s", mp, err)
 	}
@@ -479,7 +439,7 @@ func mountWithUFFD(url, mp, sock string) {
 	conf.DirEntryTimeout = time.Second
 	conf.HideInternal = true
 	jfs := vfs.NewVFS(conf, m, store, nil, nil)
-	stopUFFD, err := smartmap.Start(jfs, sock)
+	stopUFFD, err := smartmap.StartWithOptions(jfs, sock, options)
 	if err != nil {
 		log.Fatalf("smartmap socket: %s", err)
 	}
@@ -634,49 +594,23 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 			result = fuseUFFDClientResult{Error: fmt.Sprintf("helper panic: %v", r)}
 		}
 	}()
-	opened, skip, err := fuseUFFDOpenMemory(script.Sock, script.Path, script.Size)
-	if skip != "" {
-		return fuseUFFDClientResult{Skip: skip}
-	}
-	if err != nil {
-		return fuseUFFDClientResult{Error: err.Error()}
-	}
-	defer unix.Close(opened.fd)
-	defer func() { _ = fuseUFFDCloseMemory(script.Sock, opened.memoryID) }()
-
-	mapped, cleanup, skip, err := fuseUFFDMapPrivate(opened.fd, script.Size, opened.extents)
-	if skip != "" {
-		return fuseUFFDClientResult{Skip: skip}
-	}
-	if err != nil {
-		return fuseUFFDClientResult{Error: err.Error()}
-	}
-	defer cleanup()
-
-	uffdFD, closeUFFD, skip, err := fuseUFFDRegister(mapped)
-	if skip != "" {
-		return fuseUFFDClientResult{Skip: skip}
-	}
-	if err != nil {
-		return fuseUFFDClientResult{Error: err.Error()}
-	}
-	defer closeUFFD()
-
-	conn, err := fuseUFFDServeMemory(script.Sock, uffdFD, opened.memoryID, script.MaxResidentPages, mapped)
-	if err != nil {
-		return fuseUFFDClientResult{Error: err.Error()}
-	}
-	defer conn.Close()
-
 	state := &fuseUFFDClientState{
-		mapped:    mapped,
-		conn:      conn,
-		uffdFD:    uffdFD,
-		baseAddr:  uintptr(unsafe.Pointer(&mapped[0])),
 		writeback: script.WritebackPath,
 		evictions: make(chan fuseUFFDControlMessage, 8),
 	}
-	go state.serveControls()
+	handler := &fuseRustSmartmapControlHandler{state: state}
+	client, err := smartmap.OpenRustClient(script.Sock, script.Path, script.Size, 0, handler)
+	if err != nil {
+		if skip := fuseUFFDHugeTLBUnavailableReason(err); skip != "" {
+			return fuseUFFDClientResult{Skip: skip}
+		}
+		return fuseUFFDClientResult{Error: err.Error()}
+	}
+	defer client.Close()
+	state.mapped = client.Mapped()
+	state.uffdFD = client.UffdFD()
+	state.baseAddr = client.BaseAddr()
+	go client.ServeControls()
 	stopPeriodicFlush := state.startPeriodicFlush(time.Duration(script.FlushIntervalMillis) * time.Millisecond)
 	if err := state.runActions(script.Actions); err != nil {
 		_ = stopPeriodicFlush()
@@ -688,49 +622,19 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 	return fuseUFFDClientResult{OK: true}
 }
 
-func fuseUFFDOpenMemory(sock, path string, size uint64) (fuseUFFDOpenedMemory, string, error) {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	if err != nil {
-		return fuseUFFDOpenedMemory{}, "", err
-	}
-	defer conn.Close()
-	req := smartmap.UFFDRequest{Op: fuseUFFDOpOpenMemoryFile, Path: path, Size: size}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return fuseUFFDOpenedMemory{}, "", err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, nil, nil); err != nil {
-		return fuseUFFDOpenedMemory{}, "", err
-	}
-	resp, fds, err := fuseUFFDReadResponseWithFD(conn)
-	if err != nil {
-		return fuseUFFDOpenedMemory{}, "", err
-	}
-	if !resp.OK {
-		closeFuseUFFDFDs(fds)
-		return fuseUFFDOpenedMemory{}, fuseUFFDHugeTLBUnavailableReason(errors.New(resp.Error)), errors.New(resp.Error)
-	}
-	if len(fds) != 1 {
-		closeFuseUFFDFDs(fds)
-		return fuseUFFDOpenedMemory{}, "", fmt.Errorf("open_memory_file returned %d fds, want 1", len(fds))
-	}
-	return fuseUFFDOpenedMemory{fd: fds[0], memoryID: resp.MemoryID, extents: resp.Extents}, "", nil
-}
-
 func openFuseUFFDMemoryForTest(t testing.TB, sock, path string, size uint64) fuseUFFDOpenedMemory {
 	t.Helper()
-	opened, skip, err := fuseUFFDOpenMemory(sock, path, size)
-	if skip != "" {
+	client, err := smartmap.OpenRustClient(sock, path, size, 0, nil)
+	if skip := fuseUFFDHugeTLBUnavailableReason(err); skip != "" {
 		t.Skip(skip)
 	}
 	require.NoError(t, err)
-	return opened
+	return fuseUFFDOpenedMemory{client: client, extents: client.Extents()}
 }
 
-func closeFuseUFFDMemoryForTest(t testing.TB, sock string, opened fuseUFFDOpenedMemory) {
+func closeFuseUFFDMemoryForTest(t testing.TB, _ string, opened fuseUFFDOpenedMemory) {
 	t.Helper()
-	require.NoError(t, fuseUFFDCloseMemory(sock, opened.memoryID))
-	require.NoError(t, unix.Close(opened.fd))
+	opened.client.Close()
 }
 
 func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []smartmap.UFFDExtent, off uint64) uint64 {
@@ -742,165 +646,6 @@ func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []smartmap.UFFDExtent,
 	}
 	t.Fatalf("file offset %d is outside extents %#v", off, extents)
 	return 0
-}
-
-func fuseUFFDCloseMemory(sock, memoryID string) error {
-	var lastErr error
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		err := fuseUFFDCloseMemoryOnce(sock, memoryID)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !strings.Contains(err.Error(), "active") || time.Now().After(deadline) {
-			return lastErr
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func fuseUFFDCloseMemoryOnce(sock, memoryID string) error {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	req := smartmap.UFFDRequest{Op: fuseUFFDOpCloseMemoryFile, MemoryID: memoryID}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, nil, nil); err != nil {
-		return err
-	}
-	var resp fuseUFFDResponse
-	if err = json.NewDecoder(conn).Decode(&resp); err != nil {
-		return err
-	}
-	if !resp.OK {
-		return errors.New(resp.Error)
-	}
-	return nil
-}
-
-func fuseUFFDServeMemory(sock string, uffdFD int, memoryID string, maxResidentPages int, mapped []byte) (*net.UnixConn, error) {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	if err != nil {
-		return nil, err
-	}
-	req := smartmap.UFFDRequest{
-		Op:               fuseUFFDOpServeMemoryFault,
-		MemoryID:         memoryID,
-		MaxResidentPages: maxResidentPages,
-		Mappings: []smartmap.UFFDRegion{{
-			BaseHostVirtAddr: uintptr(unsafe.Pointer(&mapped[0])),
-			Size:             uintptr(len(mapped)),
-			Offset:           0,
-			PageSize:         fuseUFFDHugePageSize,
-		}},
-	}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, syscall.UnixRights(uffdFD), nil); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-func fuseUFFDReadResponseWithFD(conn *net.UnixConn) (fuseUFFDResponse, []int, error) {
-	msg := make([]byte, fuseUFFDPayloadSize)
-	oob := make([]byte, syscall.CmsgSpace(4))
-	n, oobn, flags, _, err := conn.ReadMsgUnix(msg, oob)
-	if err != nil {
-		return fuseUFFDResponse{}, nil, err
-	}
-	if flags&unix.MSG_CTRUNC != 0 || flags&unix.MSG_TRUNC != 0 {
-		return fuseUFFDResponse{}, nil, errors.New("truncated uffd response")
-	}
-	var resp fuseUFFDResponse
-	if err = json.Unmarshal(msg[:n], &resp); err != nil {
-		return fuseUFFDResponse{}, nil, err
-	}
-	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return fuseUFFDResponse{}, nil, err
-	}
-	var fds []int
-	for i := range msgs {
-		rights, err := syscall.ParseUnixRights(&msgs[i])
-		if err != nil {
-			closeFuseUFFDFDs(fds)
-			return fuseUFFDResponse{}, nil, err
-		}
-		fds = append(fds, rights...)
-	}
-	return resp, fds, nil
-}
-
-func closeFuseUFFDFDs(fds []int) {
-	for _, fd := range fds {
-		_ = unix.Close(fd)
-	}
-}
-
-func fuseUFFDMapPrivate(fd int, size uint64, extents []smartmap.UFFDExtent) ([]byte, func(), string, error) {
-	reserve, err := unix.Mmap(-1, 0, int(size+fuseUFFDHugePageSize), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
-	if err != nil {
-		return nil, nil, fuseUFFDHugeTLBUnavailableReason(err), err
-	}
-	reserveBase := uintptr(unsafe.Pointer(&reserve[0]))
-	base := (reserveBase + fuseUFFDHugePageSize - 1) & ^(uintptr(fuseUFFDHugePageSize) - 1)
-	for _, extent := range extents {
-		addr := base + uintptr(extent.FileOffset)
-		_, _, errno := syscall.Syscall6(syscall.SYS_MMAP, addr, uintptr(extent.Length), uintptr(unix.PROT_READ|unix.PROT_WRITE), uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED), uintptr(fd), uintptr(extent.ShmOffset))
-		if errno != 0 {
-			_ = unix.Munmap(reserve)
-			return nil, nil, fuseUFFDHugeTLBUnavailableReason(errno), fmt.Errorf("mmap hugetlb private extent: %w", errno)
-		}
-	}
-	mapped := unsafe.Slice((*byte)(unsafe.Pointer(base)), int(size))
-	return mapped, func() { _ = unix.Munmap(reserve) }, "", nil
-}
-
-func fuseUFFDRegister(mapped []byte) (int, func() error, string, error) {
-	fd, _, errno := syscall.Syscall(uintptr(unix.SYS_USERFAULTFD), uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK), 0, 0)
-	if errno != 0 {
-		return -1, nil, fuseUFFDUnavailableReason(errno), fmt.Errorf("userfaultfd syscall: %w", errno)
-	}
-	api := fuseUFFDIOAPI{api: fuseUFFDAPI, features: fuseUFFDFeatureMissingHugetlbfs | fuseUFFDFeatureMinorHugetlbfs | fuseUFFDFeatureWPAsync}
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(fuseUFFDIOAPIIoctl), uintptr(unsafe.Pointer(&api))); errno != 0 {
-		_ = unix.Close(int(fd))
-		return -1, nil, fuseUFFDUnavailableReason(errno), fmt.Errorf("UFFDIO_API hugetlb: %w", errno)
-	}
-	reg := fuseUFFDIORegister{
-		rng:  fuseUFFDIORange{start: uint64(uintptr(unsafe.Pointer(&mapped[0]))), len: uint64(len(mapped))},
-		mode: fuseUFFDIORegisterModeMissing | fuseUFFDIORegisterModeMinor | fuseUFFDIORegisterModeWP,
-	}
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(fuseUFFDIORegisterIoctl), uintptr(unsafe.Pointer(&reg))); errno != 0 {
-		_ = unix.Close(int(fd))
-		return -1, nil, fuseUFFDUnavailableReason(errno), fmt.Errorf("UFFDIO_REGISTER hugetlb: %w", errno)
-	}
-	var once sync.Once
-	var closeErr error
-	closeFD := func() error {
-		once.Do(func() {
-			closeErr = unix.Close(int(fd))
-		})
-		return closeErr
-	}
-	return int(fd), closeFD, "", nil
-}
-
-func fuseUFFDUnavailableReason(errno syscall.Errno) string {
-	if errors.Is(errno, syscall.ENOSYS) || errors.Is(errno, syscall.EPERM) || errors.Is(errno, syscall.EACCES) || errors.Is(errno, syscall.EINVAL) {
-		return fmt.Sprintf("%s: %s", fuseUFFDUnavailableSkipMessage, errno)
-	}
-	return ""
 }
 
 func fuseUFFDHugeTLBUnavailableReason(err error) string {
@@ -919,64 +664,39 @@ func fuseUFFDHugeTLBUnavailableReason(err error) string {
 	return ""
 }
 
-func (s *fuseUFFDClientState) serveControls() {
-	dec := json.NewDecoder(s.conn)
-	enc := json.NewEncoder(s.conn)
-	for {
-		var msg fuseUFFDControlMessage
-		if err := dec.Decode(&msg); err != nil {
-			return
-		}
-		ack := fuseUFFDControlAck{Type: msg.Type + "_ack", RequestID: msg.RequestID, OK: false, Error: "unexpected control message"}
-		if msg.Type == fuseUFFDControlEvict {
-			ack = s.handleEvict(msg)
-		} else if msg.Type == fuseUFFDControlProbe {
-			ack = s.handleProbe(msg)
-		}
-		if err := enc.Encode(ack); err != nil {
-			return
-		}
-		if ack.OK && msg.Type == fuseUFFDControlEvict {
-			select {
-			case s.evictions <- msg:
-			default:
-			}
-		}
+func (h *fuseRustSmartmapControlHandler) Evict(ranges []smartmap.RustControlRange) error {
+	msg, err := h.flushRanges(ranges)
+	if err != nil {
+		return err
 	}
+	select {
+	case h.state.evictions <- msg:
+	default:
+	}
+	return nil
 }
 
-func (s *fuseUFFDClientState) handleEvict(msg fuseUFFDControlMessage) fuseUFFDControlAck {
-	ack := fuseUFFDControlAck{Type: fuseUFFDControlEvictAck, RequestID: msg.RequestID, OK: true}
-	for _, r := range msg.Ranges {
-		if r.Length != fuseUFFDHugePageSize {
-			ack.OK = false
-			ack.Error = fmt.Sprintf("eviction length %d, want %d", r.Length, fuseUFFDHugePageSize)
-			return ack
-		}
-		if err := s.flushDirty(r.FileOffset, r.FileOffset+r.Length, true); err != nil {
-			ack.OK = false
-			ack.Error = err.Error()
-			return ack
-		}
-	}
-	return ack
+func (h *fuseRustSmartmapControlHandler) Probe(ranges []smartmap.RustControlRange) error {
+	_, err := h.flushRanges(ranges)
+	return err
 }
 
-func (s *fuseUFFDClientState) handleProbe(msg fuseUFFDControlMessage) fuseUFFDControlAck {
-	ack := fuseUFFDControlAck{Type: fuseUFFDControlProbeAck, RequestID: msg.RequestID, OK: true}
-	for _, r := range msg.Ranges {
+func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+	msg := fuseUFFDControlMessage{Ranges: make([]fuseUFFDControlRange, 0, len(ranges))}
+	for _, r := range ranges {
 		if r.Length != fuseUFFDHugePageSize {
-			ack.OK = false
-			ack.Error = fmt.Sprintf("probe length %d, want %d", r.Length, fuseUFFDHugePageSize)
-			return ack
+			return msg, fmt.Errorf("control length %d, want %d", r.Length, fuseUFFDHugePageSize)
 		}
-		if err := s.flushDirty(r.FileOffset, r.FileOffset+r.Length, true); err != nil {
-			ack.OK = false
-			ack.Error = err.Error()
-			return ack
+		msg.Ranges = append(msg.Ranges, fuseUFFDControlRange{
+			FileOffset: r.FileOffset,
+			Length:     r.Length,
+			ShmOffset:  r.ShmOffset,
+		})
+		if err := h.state.flushDirty(r.FileOffset, r.FileOffset+r.Length, true); err != nil {
+			return msg, err
 		}
 	}
-	return ack
+	return msg, nil
 }
 
 func (s *fuseUFFDClientState) startPeriodicFlush(interval time.Duration) func() error {

@@ -152,6 +152,16 @@ func TestAppendUFFDExtentCoalescesContiguousMappings(t *testing.T) {
 	}, extents)
 }
 
+func TestSmartmapOptionsResidentSize(t *testing.T) {
+	pages, err := validateOptions(Options{ResidentSize: 4 * uffdHugePageSize})
+	require.NoError(t, err)
+	require.Equal(t, 4, pages)
+
+	_, err = validateOptions(Options{ResidentSize: uffdHugePageSize + 1})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "smartmap resident size")
+}
+
 func TestUFFDControlAckIsMetadataOnly(t *testing.T) {
 	payload, err := json.Marshal(uffdControlAck{
 		Type:      uffdControlEvictAck,
@@ -215,6 +225,20 @@ func TestReadUFFDRequestRejectsMalformedPayload(t *testing.T) {
 
 	_, fds, err := readUFFDRequest(server)
 	require.Error(t, err)
+	require.Empty(t, fds)
+}
+
+func TestReadUFFDRequestRejectsClientResidentLimit(t *testing.T) {
+	server, client := unixConnPair(t)
+	defer server.Close()
+	defer client.Close()
+
+	_, err := client.Write([]byte(`{"op":"serve_memory_faults","memory_id":"memory-1","max_resident_pages":1}`))
+	require.NoError(t, err)
+
+	_, fds, err := readUFFDRequest(server)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown field")
 	require.Empty(t, fds)
 }
 
@@ -311,6 +335,34 @@ func TestUFFDSharedBeginSessionRejectsClosingMemory(t *testing.T) {
 	require.Zero(t, memory.sessions)
 }
 
+func TestUFFDSharedEvictionPrefersLessMappedPage(t *testing.T) {
+	cache := newUFFDSharedCache()
+	shared := &uffdSharedPage{key: "shared", populated: true, lastUsed: 1}
+	private := &uffdSharedPage{key: "private", populated: true, lastUsed: 2}
+	cache.pages[shared.key] = shared
+	cache.pages[private.key] = private
+	cache.resident = 2
+
+	sessionA := &uffdSharedSession{}
+	sessionB := &uffdSharedSession{}
+	cache.memories["shared-a"] = &uffdMemory{
+		pages:  map[uint64]*uffdSharedPage{0: shared},
+		active: map[*uffdSharedSession]struct{}{sessionA: {}, sessionB: {}},
+	}
+	cache.memories["shared-b"] = &uffdMemory{
+		pages:  map[uint64]*uffdSharedPage{0: shared},
+		active: map[*uffdSharedSession]struct{}{sessionA: {}},
+	}
+	cache.memories["private"] = &uffdMemory{
+		pages:  map[uint64]*uffdSharedPage{0: private},
+		active: map[*uffdSharedSession]struct{}{sessionA: {}},
+	}
+
+	victim, targets := cache.reserveEvictionVictim(nil, 2)
+	require.Same(t, private, victim)
+	require.Len(t, targets, 1)
+}
+
 func TestUFFDSharedHugeTLBMemoryIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real userfaultfd hugetlb integration test in short mode")
@@ -332,18 +384,18 @@ func TestUFFDSharedHugeTLBMemoryIntegration(t *testing.T) {
 	baseOpen, baseErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, baseErr)
 	require.NoError(t, baseErr)
-	defer unix.Close(baseOpen.fd)
+	defer baseOpen.Close()
 
 	cloneOpen, cloneErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, cloneErr)
 	require.NoError(t, cloneErr)
-	defer unix.Close(cloneOpen.fd)
+	defer cloneOpen.Close()
 	_, err = unix.Pwrite(cloneOpen.fd, []byte{0xff}, int64(shmOffsetForFileOffset(t, cloneOpen.extents, 0)))
 	require.ErrorIs(t, err, syscall.EBADF, "clients should receive a read-only shared memory fd")
 	require.Equal(t, baseOpen.extents, cloneOpen.extents, "cloned clean pages should reuse the same shared hugetlb offsets")
 	require.Len(t, cloneOpen.extents, 1, "contiguous shared pages should be returned as one extent")
 
-	runSharedUFFDClient(t, sock, cloneOpen, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, cloneOpen, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
 		{Op: "read", Offset: memorySize/2 + 33, Want: deterministicUFFDByte(memorySize/2 + 33)},
 		{Op: "read", Offset: memorySize - 1, Want: deterministicUFFDByte(memorySize - 1)},
@@ -356,11 +408,11 @@ func TestUFFDSharedHugeTLBMemoryIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, deterministicUFFDByte(0), shared[0], "write-protected CoW must not alter the shared clean page")
 
-	requireCloseSharedMemoryFile(t, sock, cloneOpen.memoryID)
+	requireCloseSharedMemoryFile(t, cloneOpen)
 	refreshed, refreshErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, refreshErr)
 	require.NoError(t, refreshErr)
-	defer unix.Close(refreshed.fd)
+	defer refreshed.Close()
 	require.Equal(t, shmOffsetForFileOffset(t, cloneOpen.extents, 0), shmOffsetForFileOffset(t, refreshed.extents, 0), "private writes without FUSE writeback must not change the file backing")
 	require.Equal(t, shmOffsetForFileOffset(t, cloneOpen.extents, uffdHugePageSize), shmOffsetForFileOffset(t, refreshed.extents, uffdHugePageSize), "unchanged cloned page should still share backing")
 	require.Equal(t, shmOffsetForFileOffset(t, cloneOpen.extents, memorySize-uffdHugePageSize), shmOffsetForFileOffset(t, refreshed.extents, memorySize-uffdHugePageSize), "untouched last page should still share backing")
@@ -386,13 +438,13 @@ func TestUFFDSharedRejectsOutsideMapping(t *testing.T) {
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
-	script := newSharedUFFDClientScript(sock, opened, memorySize, 0, []uffdClientAction{
+	script := newSharedUFFDClientScript(sock, opened, memorySize, []uffdClientAction{
 		{Op: "outside_error", Offset: uffdHugePageSize, ErrorContains: "outside smartmap mappings"},
 	})
 	script.RegionSize = uffdHugePageSize
-	runUFFDClientProcess(t, script, opened.fd)
+	runUFFDClientProcess(t, script)
 }
 
 func TestUFFDSharedRefreshUsesOpenedInodeAfterRename(t *testing.T) {
@@ -441,20 +493,20 @@ func TestUFFDSharedExtentsDedupeAcrossMultipleClones(t *testing.T) {
 	baseOpen, baseErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, baseErr)
 	require.NoError(t, baseErr)
-	defer unix.Close(baseOpen.fd)
+	defer baseOpen.Close()
 
 	cloneA, err := openSharedMemoryFile(t, sock, "/clone-a", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(cloneA.fd)
+	defer cloneA.Close()
 	cloneB, err := openSharedMemoryFile(t, sock, "/clone-b", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(cloneB.fd)
+	defer cloneB.Close()
 	cloneC, err := openSharedMemoryFile(t, sock, "/clone-c", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(cloneC.fd)
+	defer cloneC.Close()
 
 	require.Equal(t, baseOpen.extents, cloneA.extents)
 	require.Equal(t, baseOpen.extents, cloneB.extents)
@@ -471,15 +523,15 @@ func TestUFFDSharedExtentsDedupeAcrossMultipleClones(t *testing.T) {
 	refreshedB, err := openSharedMemoryFile(t, sock, "/clone-b", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(refreshedB.fd)
+	defer refreshedB.Close()
 	refreshedA, err := openSharedMemoryFile(t, sock, "/clone-a", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(refreshedA.fd)
+	defer refreshedA.Close()
 	refreshedC, err := openSharedMemoryFile(t, sock, "/clone-c", memorySize)
 	skipUnavailableHugeTLB(t, err)
 	require.NoError(t, err)
-	defer unix.Close(refreshedC.fd)
+	defer refreshedC.Close()
 
 	require.Len(t, refreshedB.extents, 3, "one dirty page in the middle should split the layout into before/dirty/after extents")
 	require.NotEqual(t, shmOffsetForFileOffset(t, cloneB.extents, dirtyOffset), shmOffsetForFileOffset(t, refreshedB.extents, dirtyOffset))
@@ -513,7 +565,7 @@ func TestUFFDSharedDelayedFaultUsesOpenedSource(t *testing.T) {
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
 	dirty := deterministicUFFDData(uffdHugePageSize)
 	for i := range dirty {
@@ -521,7 +573,7 @@ func TestUFFDSharedDelayedFaultUsesOpenedSource(t *testing.T) {
 	}
 	overwriteVFSFileRange(t, v, ctx, "base-memory", dirty, 0)
 
-	runSharedUFFDClient(t, sock, opened, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, opened, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
 	})
 	stop()
@@ -548,16 +600,16 @@ func TestUFFDSharedWriteFirstFaultCOW(t *testing.T) {
 	baseOpen, baseErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, baseErr)
 	require.NoError(t, baseErr)
-	defer unix.Close(baseOpen.fd)
+	defer baseOpen.Close()
 
 	opened, openErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 	require.Equal(t, baseOpen.extents, opened.extents)
 
 	const privateByte = 0x6d
-	runSharedUFFDClient(t, sock, opened, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, opened, memorySize, []uffdClientAction{
 		{Op: "write", Offset: 0, Value: privateByte},
 		{Op: "read", Offset: 0, Want: privateByte},
 		{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
@@ -568,11 +620,11 @@ func TestUFFDSharedWriteFirstFaultCOW(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, deterministicUFFDByte(0), shared[0], "write-protected CoW must not mutate shared clean backing")
 
-	requireCloseSharedMemoryFile(t, sock, opened.memoryID)
+	requireCloseSharedMemoryFile(t, opened)
 	refreshed, refreshErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, refreshErr)
 	require.NoError(t, refreshErr)
-	defer unix.Close(refreshed.fd)
+	defer refreshed.Close()
 	require.Equal(t, shmOffsetForFileOffset(t, opened.extents, 0), shmOffsetForFileOffset(t, refreshed.extents, 0), "private writes without FUSE writeback must not change the file backing")
 	require.Equal(t, shmOffsetForFileOffset(t, opened.extents, uffdHugePageSize), shmOffsetForFileOffset(t, refreshed.extents, uffdHugePageSize), "clean neighboring page should remain deduped")
 }
@@ -597,19 +649,19 @@ func TestUFFDSharedConcurrentSamePageFaults(t *testing.T) {
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
 	const clients = 4
 	releaseFile := filepath.Join(t.TempDir(), "release")
 	procs := make([]*uffdClientProcess, 0, clients)
 	for i := 0; i < clients; i++ {
 		readyFile := filepath.Join(t.TempDir(), fmt.Sprintf("ready-%d", i))
-		script := newSharedUFFDClientScript(sock, opened, memorySize, 0, []uffdClientAction{
+		script := newSharedUFFDClientScript(sock, opened, memorySize, []uffdClientAction{
 			{Op: "mark_ready", ReadyFile: readyFile},
 			{Op: "wait_file", ReadyFile: releaseFile},
 			{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
 		})
-		procs = append(procs, startUFFDClientProcess(t, script, opened.fd, uffdClientTimeout(script)))
+		procs = append(procs, startUFFDClientProcess(t, script, uffdClientTimeout(script)))
 		require.Eventually(t, func() bool {
 			_, err := os.Stat(readyFile)
 			return err == nil
@@ -647,20 +699,20 @@ func TestUFFDSharedTwoClientsShareClonedFile(t *testing.T) {
 	firstOpen, firstErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, firstErr)
 	require.NoError(t, firstErr)
-	defer unix.Close(firstOpen.fd)
+	defer firstOpen.Close()
 	secondOpen, secondErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, secondErr)
 	require.NoError(t, secondErr)
-	defer unix.Close(secondOpen.fd)
+	defer secondOpen.Close()
 	require.Equal(t, firstOpen.extents, secondOpen.extents)
 
 	const privateByte = 0x41
-	runSharedUFFDClient(t, sock, firstOpen, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, firstOpen, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
 		{Op: "write", Offset: 0, Value: privateByte},
 		{Op: "read", Offset: 0, Want: privateByte},
 	})
-	runSharedUFFDClient(t, sock, secondOpen, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, secondOpen, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 0, Want: deterministicUFFDByte(0)},
 		{Op: "read", Offset: memorySize/2 + 9, Want: deterministicUFFDByte(memorySize/2 + 9)},
 	})
@@ -692,21 +744,21 @@ func TestUFFDSharedReleasedMemoryReusesSlotWithFreshData(t *testing.T) {
 	oldOpen, openErr := openSharedMemoryFile(t, sock, "/old-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(oldOpen.fd)
+	defer oldOpen.Close()
 
-	runSharedUFFDClient(t, sock, oldOpen, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, oldOpen, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 0, Want: patternedUFFDByte(0x11, 0)},
 		{Op: "read", Offset: 12345, Want: patternedUFFDByte(0x11, 12345)},
 	})
-	requireCloseSharedMemoryFile(t, sock, oldOpen.memoryID)
+	requireCloseSharedMemoryFile(t, oldOpen)
 
 	newOpen, openErr := openSharedMemoryFile(t, sock, "/new-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(newOpen.fd)
+	defer newOpen.Close()
 	require.Equal(t, shmOffsetForFileOffset(t, oldOpen.extents, 0), shmOffsetForFileOffset(t, newOpen.extents, 0), "released slot should be reused instead of growing the shared file")
 
-	runSharedUFFDClient(t, sock, newOpen, memorySize, 0, []uffdClientAction{
+	runSharedUFFDClient(t, sock, newOpen, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 0, Want: patternedUFFDByte(0x82, 0)},
 		{Op: "read", Offset: 12345, Want: patternedUFFDByte(0x82, 12345)},
 	})
@@ -733,27 +785,27 @@ func TestUFFDSharedCloseMemoryKeepsCloneReference(t *testing.T) {
 	baseOpen, baseErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, baseErr)
 	require.NoError(t, baseErr)
-	defer unix.Close(baseOpen.fd)
+	defer baseOpen.Close()
 	cloneOpen, cloneErr := openSharedMemoryFile(t, sock, "/clone-memory", memorySize)
 	skipUnavailableHugeTLB(t, cloneErr)
 	require.NoError(t, cloneErr)
-	defer unix.Close(cloneOpen.fd)
+	defer cloneOpen.Close()
 	require.Equal(t, baseOpen.extents, cloneOpen.extents)
 
 	baseOffset := shmOffsetForFileOffset(t, baseOpen.extents, 0)
-	require.NoError(t, closeSharedMemoryFile(t, sock, baseOpen.memoryID))
+	require.NoError(t, baseOpen.client.CloseMemory())
 
 	otherOpen, otherErr := openSharedMemoryFile(t, sock, "/other-memory", memorySize)
 	skipUnavailableHugeTLB(t, otherErr)
 	require.NoError(t, otherErr)
-	defer unix.Close(otherOpen.fd)
+	defer otherOpen.Close()
 	require.NotEqual(t, baseOffset, shmOffsetForFileOffset(t, otherOpen.extents, 0), "closing one clone reference must not free a page still used by another open memory")
 
-	require.NoError(t, closeSharedMemoryFile(t, sock, cloneOpen.memoryID))
+	require.NoError(t, cloneOpen.client.CloseMemory())
 	afterOpen, afterErr := openSharedMemoryFile(t, sock, "/after-memory", memorySize)
 	skipUnavailableHugeTLB(t, afterErr)
 	require.NoError(t, afterErr)
-	defer unix.Close(afterOpen.fd)
+	defer afterOpen.Close()
 	require.Equal(t, baseOffset, shmOffsetForFileOffset(t, afterOpen.extents, 0), "slot should become reusable after the last clone reference is closed")
 }
 
@@ -775,29 +827,34 @@ func TestUFFDSharedCloseMemoryRejectsActiveSession(t *testing.T) {
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
 	readyFile := filepath.Join(t.TempDir(), "ready")
 	releaseFile := filepath.Join(t.TempDir(), "release")
-	script := newSharedUFFDClientScript(sock, opened, memorySize, 0, []uffdClientAction{
+	script := newSharedUFFDClientScript(sock, opened, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 0, Want: patternedUFFDByte(0x33, 0)},
 		{Op: "mark_ready", ReadyFile: readyFile},
 		{Op: "wait_file", ReadyFile: releaseFile},
 		{Op: "read", Offset: 12345, Want: patternedUFFDByte(0x33, 12345)},
 	})
-	proc := startUFFDClientProcess(t, script, opened.fd, uffdClientTimeout(script))
+	proc := startUFFDClientProcess(t, script, uffdClientTimeout(script))
 	require.Eventually(t, func() bool {
 		_, err := os.Stat(readyFile)
 		return err == nil
 	}, 5*time.Second, 10*time.Millisecond)
 
-	closeErr := closeSharedMemoryFile(t, sock, opened.memoryID)
+	activeClient, activeErr := OpenRustClient(sock, "/base-memory", memorySize, 0, nil)
+	skipUnavailableHugeTLB(t, activeErr)
+	require.NoError(t, activeErr)
+	require.Equal(t, patternedUFFDByte(0x33, 0), readMappedByte(t, activeClient.Mapped(), 0))
+	closeErr := activeClient.CloseMemory()
+	activeClient.Close()
 	require.Error(t, closeErr)
 	require.Contains(t, closeErr.Error(), "active")
 	require.NoError(t, os.WriteFile(releaseFile, []byte("go\n"), 0600))
 	requireUFFDClientResult(t, proc.wait(t))
 
-	requireCloseSharedMemoryFile(t, sock, opened.memoryID)
+	requireCloseSharedMemoryFile(t, opened)
 }
 
 func TestUFFDSharedResidentBudgetEvictsAndRefaultsCleanPages(t *testing.T) {
@@ -813,16 +870,16 @@ func TestUFFDSharedResidentBudgetEvictsAndRefaultsCleanPages(t *testing.T) {
 	writeLargeVFSFile(t, v, ctx, "base-memory", memorySize)
 
 	sock := filepath.Join(t.TempDir(), "smartmap.sock")
-	stop, err := Start(v, sock)
+	stop, err := StartWithOptions(v, sock, Options{ResidentSize: uffdHugePageSize})
 	require.NoError(t, err)
 	defer stop()
 
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
-	runSharedUFFDClient(t, sock, opened, memorySize, 1, []uffdClientAction{
+	runSharedUFFDClient(t, sock, opened, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 17, Want: deterministicUFFDByte(17)},
 		{Op: "read", Offset: uffdHugePageSize + 23, Want: deterministicUFFDByte(uffdHugePageSize + 23)},
 		{Op: "expect_eviction", Offset: 0},
@@ -848,16 +905,16 @@ func TestUFFDSharedProbeEvictionComparesAgainstFaultOnlyLRU(t *testing.T) {
 		writeLargeVFSFile(t, v, ctx, "base-memory", memorySize)
 
 		sock := filepath.Join(t.TempDir(), "smartmap.sock")
-		stop, err := Start(v, sock)
+		stop, err := StartWithOptions(v, sock, Options{ResidentSize: 4 * uffdHugePageSize})
 		require.NoError(t, err)
 		defer stop()
 
 		opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 		skipUnavailableHugeTLB(t, openErr)
 		require.NoError(t, openErr)
-		defer unix.Close(opened.fd)
+		defer opened.Close()
 
-		runSharedUFFDClient(t, sock, opened, memorySize, 4, []uffdClientAction{
+		runSharedUFFDClient(t, sock, opened, memorySize, []uffdClientAction{
 			{Op: "read", Offset: 0, Want: deterministicUFFDByte(0)},
 			{Op: "read", Offset: uffdHugePageSize, Want: deterministicUFFDByte(uffdHugePageSize)},
 			{Op: "read", Offset: 2 * uffdHugePageSize, Want: deterministicUFFDByte(2 * uffdHugePageSize)},
@@ -874,16 +931,22 @@ func TestUFFDSharedProbeEvictionComparesAgainstFaultOnlyLRU(t *testing.T) {
 		writeLargeVFSFile(t, v, ctx, "base-memory", memorySize)
 
 		sock := filepath.Join(t.TempDir(), "smartmap.sock")
-		stop, err := Start(v, sock)
+		stop, err := StartWithOptions(v, sock, Options{
+			ResidentSize:        4 * uffdHugePageSize,
+			EvictionPolicy:      uffdEvictionPolicyProbe,
+			ProbeCandidatePages: 2,
+			ProbeEvictPages:     1,
+			ProbeMonitorMillis:  40,
+		})
 		require.NoError(t, err)
 		defer stop()
 
 		opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 		skipUnavailableHugeTLB(t, openErr)
 		require.NoError(t, openErr)
-		defer unix.Close(opened.fd)
+		defer opened.Close()
 
-		script := newSharedUFFDClientScript(sock, opened, memorySize, 4, []uffdClientAction{
+		script := newSharedUFFDClientScript(sock, opened, memorySize, []uffdClientAction{
 			{Op: "read", Offset: 0, Want: deterministicUFFDByte(0)},
 			{Op: "read", Offset: uffdHugePageSize, Want: deterministicUFFDByte(uffdHugePageSize)},
 			{Op: "read", Offset: 2 * uffdHugePageSize, Want: deterministicUFFDByte(2 * uffdHugePageSize)},
@@ -894,11 +957,7 @@ func TestUFFDSharedProbeEvictionComparesAgainstFaultOnlyLRU(t *testing.T) {
 			{Op: "read", Offset: 4 * uffdHugePageSize, Want: deterministicUFFDByte(4 * uffdHugePageSize)},
 			{Op: "expect_eviction", Offset: uffdHugePageSize},
 		})
-		script.EvictionPolicy = uffdEvictionPolicyProbe
-		script.ProbeCandidates = 2
-		script.ProbeEvict = 1
-		script.ProbeMonitorMS = 40
-		runUFFDClientProcess(t, script, opened.fd)
+		runUFFDClientProcess(t, script)
 	})
 }
 
@@ -915,16 +974,16 @@ func TestUFFDSharedRefaultProtectionKeepsQuickRefaultsByDefault(t *testing.T) {
 	writeLargeVFSFile(t, v, ctx, "base-memory", memorySize)
 
 	sock := filepath.Join(t.TempDir(), "smartmap.sock")
-	stop, err := Start(v, sock)
+	stop, err := StartWithOptions(v, sock, Options{ResidentSize: 4 * uffdHugePageSize})
 	require.NoError(t, err)
 	defer stop()
 
 	opened, openErr := openSharedMemoryFile(t, sock, "/base-memory", memorySize)
 	skipUnavailableHugeTLB(t, openErr)
 	require.NoError(t, openErr)
-	defer unix.Close(opened.fd)
+	defer opened.Close()
 
-	runSharedUFFDClient(t, sock, opened, memorySize, 4, []uffdClientAction{
+	runSharedUFFDClient(t, sock, opened, memorySize, []uffdClientAction{
 		{Op: "read", Offset: 0, Want: deterministicUFFDByte(0)},
 		{Op: "read", Offset: uffdHugePageSize, Want: deterministicUFFDByte(uffdHugePageSize)},
 		{Op: "read", Offset: 2 * uffdHugePageSize, Want: deterministicUFFDByte(2 * uffdHugePageSize)},
@@ -989,32 +1048,15 @@ func BenchmarkUFFDSharedFirstFault2MiB(b *testing.B) {
 			}
 			defer stop()
 
-			opened, err := openSharedMemoryFile(b, sock, "/base-memory", memorySize)
+			client, err := OpenRustClient(sock, "/base-memory", memorySize, 0, nil)
 			skipUnavailableHugeTLB(b, err)
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer unix.Close(opened.fd)
-
-			mapped, cleanupMapping := mapSharedMemoryExtents(b, opened.fd, memorySize, opened.extents)
-			defer cleanupMapping()
-			uffdFD, closeUFFD := registerHugeTLBUFFDRange(b, mapped)
-			defer closeUFFD()
-
-			serveConn := sendUFFDRequest(b, sock, uffdFD, UFFDRequest{
-				Op:       uffdOpServeMemoryFault,
-				MemoryID: opened.memoryID,
-				Mappings: []UFFDRegion{{
-					BaseHostVirtAddr: uintptr(unsafe.Pointer(&mapped[0])),
-					Size:             uintptr(len(mapped)),
-					Offset:           0,
-					PageSize:         uffdHugePageSize,
-				}},
-			})
-			defer serveConn.Close()
+			defer client.Close()
 
 			b.StartTimer()
-			if got := readMappedByte(b, mapped, 17); got != deterministicUFFDByte(17) {
+			if got := readMappedByte(b, client.Mapped(), 17); got != deterministicUFFDByte(17) {
 				b.Fatalf("got byte %d", got)
 			}
 			b.StopTimer()
@@ -1119,26 +1161,18 @@ func patternedUFFDByte(seed byte, i int) byte {
 }
 
 const (
-	uffdClientHelperEnv      = "JUICEFS_UFFD_CLIENT_HELPER"
-	uffdClientSharedMemoryFD = 3
-	pagemapEntrySize         = 8
-	pagemapPresentBit        = uint64(1) << 63
-	pagemapUFFDWPBit         = uint64(1) << 57
+	uffdClientHelperEnv = "JUICEFS_UFFD_CLIENT_HELPER"
+	pagemapEntrySize    = 8
+	pagemapPresentBit   = uint64(1) << 63
+	pagemapUFFDWPBit    = uint64(1) << 57
 )
 
 type uffdClientScript struct {
 	Sock              string             `json:"sock"`
+	Path              string             `json:"path,omitempty"`
 	Size              uint64             `json:"size"`
 	RegionSize        uint64             `json:"region_size,omitempty"`
-	MemoryID          string             `json:"memory_id,omitempty"`
-	SharedMemoryFD    int                `json:"shared_memory_fd,omitempty"`
 	WritebackPath     string             `json:"writeback_path,omitempty"`
-	Extents           []UFFDExtent       `json:"extents,omitempty"`
-	MaxResidentPages  int                `json:"max_resident_pages,omitempty"`
-	EvictionPolicy    string             `json:"eviction_policy,omitempty"`
-	ProbeCandidates   int                `json:"probe_candidates,omitempty"`
-	ProbeEvict        int                `json:"probe_evict,omitempty"`
-	ProbeMonitorMS    int                `json:"probe_monitor_ms,omitempty"`
 	Actions           []uffdClientAction `json:"actions,omitempty"`
 	TimeoutMultiplier int                `json:"timeout_multiplier,omitempty"`
 }
@@ -1201,81 +1235,80 @@ func runUFFDClientScript(script uffdClientScript) (result uffdClientResult) {
 }
 
 func runSharedUFFDClientScript(script uffdClientScript) uffdClientResult {
-	if script.SharedMemoryFD <= 0 {
-		return uffdClientResult{Error: "missing shared_memory_fd"}
-	}
-	defer unix.Close(script.SharedMemoryFD)
-
-	mapped, cleanupMapping, skip, err := mapSharedMemoryExtentsClient(script.SharedMemoryFD, script.Size, script.Extents)
-	if skip != "" {
-		return uffdClientResult{Skip: skip}
-	}
-	if err != nil {
-		return uffdClientResult{Error: err.Error()}
-	}
-	defer cleanupMapping()
-
-	uffdFD, closeUFFD, skip, err := registerHugeTLBUFFDRangeClient(mapped)
-	if skip != "" {
-		return uffdClientResult{Skip: skip}
-	}
-	if err != nil {
-		return uffdClientResult{Error: err.Error()}
-	}
-	defer closeUFFD()
-
-	regionSize := script.RegionSize
-	if regionSize == 0 {
-		regionSize = uint64(len(mapped))
-	}
-	if regionSize > uint64(len(mapped)) {
-		return uffdClientResult{Error: fmt.Sprintf("region_size %d exceeds mapping size %d", regionSize, len(mapped))}
-	}
-	conn, err := sendUFFDRequestClient(script.Sock, uffdFD, UFFDRequest{
-		Op:                  uffdOpServeMemoryFault,
-		MemoryID:            script.MemoryID,
-		MaxResidentPages:    script.MaxResidentPages,
-		EvictionPolicy:      script.EvictionPolicy,
-		ProbeCandidatePages: script.ProbeCandidates,
-		ProbeEvictPages:     script.ProbeEvict,
-		ProbeMonitorMillis:  script.ProbeMonitorMS,
-		Mappings: []UFFDRegion{{
-			BaseHostVirtAddr: uintptr(unsafe.Pointer(&mapped[0])),
-			Size:             uintptr(regionSize),
-			Offset:           0,
-			PageSize:         uffdHugePageSize,
-		}},
-	})
-	if err != nil {
-		return uffdClientResult{Error: err.Error()}
-	}
-	defer conn.Close()
-
-	session := &cooperativeSharedFaultSession{
-		mapped:    mapped,
-		conn:      conn,
-		uffdFD:    uffdFD,
-		baseAddr:  uintptr(unsafe.Pointer(&mapped[0])),
+	handler := &testRustSmartmapControlHandler{
 		writeback: script.WritebackPath,
 		evictions: make(chan uffdControlMessage, 16),
 		probes:    make(chan uffdControlMessage, 16),
 	}
-	go session.serveControls()
+	client, err := OpenRustClient(script.Sock, script.Path, script.Size, script.RegionSize, handler)
+	if err != nil {
+		if skip := hugeTLBUnavailableReason(err); skip != "" {
+			return uffdClientResult{Skip: skip}
+		}
+		return uffdClientResult{Error: err.Error()}
+	}
+	defer client.Close()
+	handler.mapped = client.Mapped()
+	handler.uffdFD = client.UffdFD()
+	handler.baseAddr = client.BaseAddr()
+	go client.ServeControls()
 
 	state := uffdClientActionState{
-		conn:       conn,
-		closeUFFD:  closeUFFD,
-		evictions:  session.evictions,
-		probes:     session.probes,
-		uffdFD:     uffdFD,
-		baseAddr:   uintptr(unsafe.Pointer(&mapped[0])),
+		evictions:  handler.evictions,
+		probes:     handler.probes,
+		closeUFFD:  func() error { client.CloseFaults(); return nil },
+		uffdFD:     client.UffdFD(),
+		baseAddr:   client.BaseAddr(),
 		writeback:  script.WritebackPath,
 		mappedName: "shared memory range",
 	}
-	if err := runUFFDClientActions(mapped, script.Actions, state); err != nil {
+	if err := runUFFDClientActions(client.Mapped(), script.Actions, state); err != nil {
 		return uffdClientResult{Error: err.Error()}
 	}
 	return uffdClientResult{OK: true}
+}
+
+type testRustSmartmapControlHandler struct {
+	mapped    []byte
+	uffdFD    int
+	baseAddr  uintptr
+	writeback string
+	evictions chan uffdControlMessage
+	probes    chan uffdControlMessage
+}
+
+func (h *testRustSmartmapControlHandler) Evict(ranges []RustControlRange) error {
+	msg := h.controlMessage(uffdControlEvict, ranges)
+	state := uffdClientActionState{uffdFD: h.uffdFD, baseAddr: h.baseAddr, writeback: h.writeback}
+	if err := flushCooperativeEvictionRanges(h.mapped, state, msg.Ranges); err != nil {
+		return err
+	}
+	select {
+	case h.evictions <- msg:
+	default:
+	}
+	return nil
+}
+
+func (h *testRustSmartmapControlHandler) Probe(ranges []RustControlRange) error {
+	msg := h.controlMessage(uffdControlProbe, ranges)
+	state := uffdClientActionState{uffdFD: h.uffdFD, baseAddr: h.baseAddr, writeback: h.writeback}
+	if err := dropCooperativeRanges(h.mapped, state, msg.Ranges); err != nil {
+		return err
+	}
+	select {
+	case h.probes <- msg:
+	default:
+	}
+	return nil
+}
+
+func (h *testRustSmartmapControlHandler) controlMessage(kind string, ranges []RustControlRange) uffdControlMessage {
+	msg := uffdControlMessage{Type: kind, RequestID: 1}
+	for _, r := range ranges {
+		msg.Ranges = append(msg.Ranges, uffdControlRange{FileOffset: r.FileOffset, Length: r.Length, ShmOffset: r.ShmOffset})
+	}
+	return msg
 }
 
 func runUFFDClientActions(mapped []byte, actions []uffdClientAction, state uffdClientActionState) error {
@@ -1355,7 +1388,30 @@ func checkedMappedIndex(mapped []byte, off uint64) (int, error) {
 }
 
 func runOutsideRegionFaultAction(mapped []byte, action uffdClientAction, state uffdClientActionState) error {
-	if state.conn == nil || state.closeUFFD == nil {
+	if state.conn == nil {
+		if state.closeUFFD == nil {
+			return errors.New("outside_error action requires a uffd connection")
+		}
+		idx, err := checkedMappedIndex(mapped, action.Offset)
+		if err != nil {
+			return err
+		}
+		touchDone := make(chan byte, 1)
+		go func() {
+			touchDone <- mapped[idx]
+		}()
+		time.Sleep(50 * time.Millisecond)
+		if err := state.closeUFFD(); err != nil {
+			return fmt.Errorf("close uffd after outside-region fault: %w", err)
+		}
+		select {
+		case <-touchDone:
+			return nil
+		case <-time.After(5 * time.Second):
+			return errors.New("outside-region fault did not unblock after closing userfaultfd")
+		}
+	}
+	if state.closeUFFD == nil {
 		return errors.New("outside_error action requires a uffd connection")
 	}
 	idx, err := checkedMappedIndex(mapped, action.Offset)
@@ -1499,44 +1555,29 @@ func isPrivatePageDirty(pagemap *os.File, addr uintptr) (bool, error) {
 	return entry&pagemapUFFDWPBit == 0, nil
 }
 
-func runSharedUFFDClient(t testing.TB, sock string, opened sharedMemoryOpen, size uint64, maxResidentPages int, actions []uffdClientAction) {
+func runSharedUFFDClient(t testing.TB, sock string, opened sharedMemoryOpen, size uint64, actions []uffdClientAction) {
 	t.Helper()
-	runUFFDClientProcess(t, newSharedUFFDClientScript(sock, opened, size, maxResidentPages, actions), opened.fd)
+	runUFFDClientProcess(t, newSharedUFFDClientScript(sock, opened, size, actions))
 }
 
-func newSharedUFFDClientScript(sock string, opened sharedMemoryOpen, size uint64, maxResidentPages int, actions []uffdClientAction) uffdClientScript {
+func newSharedUFFDClientScript(sock string, opened sharedMemoryOpen, size uint64, actions []uffdClientAction) uffdClientScript {
 	return uffdClientScript{
-		Sock:             sock,
-		Size:             size,
-		MemoryID:         opened.memoryID,
-		Extents:          opened.extents,
-		MaxResidentPages: maxResidentPages,
-		Actions:          actions,
+		Sock:    sock,
+		Path:    opened.path,
+		Size:    size,
+		Actions: actions,
 	}
 }
 
-func runUFFDClientProcess(t testing.TB, script uffdClientScript, sharedFD int) uffdClientResult {
+func runUFFDClientProcess(t testing.TB, script uffdClientScript) uffdClientResult {
 	t.Helper()
-	proc := startUFFDClientProcess(t, script, sharedFD, uffdClientTimeout(script))
+	proc := startUFFDClientProcess(t, script, uffdClientTimeout(script))
 	result := proc.wait(t)
 	requireUFFDClientResult(t, result)
 	return result
 }
 
-func startUFFDClientProcess(t testing.TB, script uffdClientScript, sharedFD int, timeout time.Duration) *uffdClientProcess {
-	t.Helper()
-	if sharedFD >= 0 {
-		dup, err := unix.Dup(sharedFD)
-		require.NoError(t, err)
-		sharedFile := os.NewFile(uintptr(dup), "uffd-shared-memory")
-		defer sharedFile.Close()
-		script.SharedMemoryFD = uffdClientSharedMemoryFD
-		return startUFFDClientProcessWithFiles(t, script, timeout, sharedFile)
-	}
-	return startUFFDClientProcessWithFiles(t, script, timeout)
-}
-
-func startUFFDClientProcessWithFiles(t testing.TB, script uffdClientScript, timeout time.Duration, extraFiles ...*os.File) *uffdClientProcess {
+func startUFFDClientProcess(t testing.TB, script uffdClientScript, timeout time.Duration) *uffdClientProcess {
 	t.Helper()
 	payload, err := json.Marshal(script)
 	require.NoError(t, err)
@@ -1545,7 +1586,6 @@ func startUFFDClientProcessWithFiles(t testing.TB, script uffdClientScript, time
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUFFDClientHelperProcess$")
 	cmd.Env = append(os.Environ(), uffdClientHelperEnv+"=1")
 	cmd.Stdin = bytes.NewReader(payload)
-	cmd.ExtraFiles = extraFiles
 
 	proc := &uffdClientProcess{cmd: cmd, ctx: ctx, cancel: cancel, done: make(chan error, 1)}
 	cmd.Stdout = &proc.stdout
@@ -1594,155 +1634,18 @@ func uffdClientTimeout(script uffdClientScript) time.Duration {
 	return timeout
 }
 
-func mapSharedMemoryExtentsClient(fd int, size uint64, extents []UFFDExtent) ([]byte, func(), string, error) {
-	reserve, err := unix.Mmap(-1, 0, int(size+uffdHugePageSize), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
-	if err != nil {
-		return nil, nil, hugeTLBUnavailableReason(err), err
-	}
-	reserveBase := uintptr(unsafe.Pointer(&reserve[0]))
-	base := (reserveBase + uffdHugePageSize - 1) & ^(uintptr(uffdHugePageSize) - 1)
-	for _, extent := range extents {
-		if extent.FileOffset%uffdHugePageSize != 0 || extent.Length%uffdHugePageSize != 0 || extent.ShmOffset%uffdHugePageSize != 0 {
-			_ = unix.Munmap(reserve)
-			return nil, nil, "", fmt.Errorf("unaligned shared memory extent: %#v", extent)
-		}
-		addr := base + uintptr(extent.FileOffset)
-		_, _, errno := syscall.Syscall6(syscall.SYS_MMAP, addr, uintptr(extent.Length), uintptr(unix.PROT_READ|unix.PROT_WRITE), uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED), uintptr(fd), uintptr(extent.ShmOffset))
-		if errno != 0 {
-			_ = unix.Munmap(reserve)
-			return nil, nil, hugeTLBUnavailableReason(errno), fmt.Errorf("mmap hugetlb shared extent: %w", errno)
-		}
-	}
-	mapped := unsafe.Slice((*byte)(unsafe.Pointer(base)), int(size))
-	cleanup := func() {
-		_ = unix.Munmap(reserve)
-	}
-	return mapped, cleanup, "", nil
-}
-
-func registerHugeTLBUFFDRangeClient(mapped []byte) (int, func() error, string, error) {
-	fd, _, errno := syscall.Syscall(uintptr(nrUserfaultfd), uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK), 0, 0)
-	if errno != 0 {
-		return -1, nil, uffdUnavailableReason(errno), fmt.Errorf("userfaultfd syscall: %w", errno)
-	}
-	api := newUFFDIOAPI(uint64(uffdAPI), uint64(uffdFeatureMissingHugetlbfs|uffdFeatureMinorHugetlbfs|uffdFeatureWPAsync))
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(uffdioAPIIoctl), uintptr(unsafe.Pointer(&api))); errno != 0 {
-		_ = unix.Close(int(fd))
-		return -1, nil, uffdUnavailableReason(errno), fmt.Errorf("UFFDIO_API hugetlb: %w", errno)
-	}
-	reg := newUFFDIORegister(uintptr(unsafe.Pointer(&mapped[0])), uintptr(len(mapped)), uint64(uffdioRegisterModeMissing|uffdioRegisterModeMinor|uffdioRegisterModeWP))
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(uffdioRegisterIoctl), uintptr(unsafe.Pointer(&reg))); errno != 0 {
-		_ = unix.Close(int(fd))
-		return -1, nil, uffdUnavailableReason(errno), fmt.Errorf("UFFDIO_REGISTER hugetlb: %w", errno)
-	}
-	var once sync.Once
-	var closeErr error
-	closeFD := func() error {
-		once.Do(func() {
-			closeErr = unix.Close(int(fd))
-		})
-		return closeErr
-	}
-	return int(fd), closeFD, "", nil
-}
-
-func sendUFFDRequestClient(sock string, fd int, req UFFDRequest) (*net.UnixConn, error) {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	if err != nil {
-		return nil, err
-	}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, syscall.UnixRights(fd), nil); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
 type sharedMemoryOpen struct {
+	client   *RustClient
 	fd       int
 	memoryID string
 	extents  []UFFDExtent
+	path     string
 }
 
-type cooperativeSharedFaultSession struct {
-	mapped    []byte
-	conn      *net.UnixConn
-	uffdFD    int
-	baseAddr  uintptr
-	writeback string
-	evictions chan uffdControlMessage
-	probes    chan uffdControlMessage
-}
-
-func (s *cooperativeSharedFaultSession) serveControls() {
-	dec := json.NewDecoder(s.conn)
-	enc := json.NewEncoder(s.conn)
-	for {
-		var msg uffdControlMessage
-		if err := dec.Decode(&msg); err != nil {
-			return
-		}
-		if msg.Type == "" {
-			return
-		}
-		var ack uffdControlAck
-		switch msg.Type {
-		case uffdControlEvict:
-			ack = s.handleEvictControl(msg)
-		case uffdControlProbe:
-			ack = s.handleProbeControl(msg)
-		default:
-			ack = uffdControlAck{Type: msg.Type + "_ack", RequestID: msg.RequestID, Error: "unexpected control message"}
-		}
-		if encodeErr := enc.Encode(ack); encodeErr != nil {
-			return
-		}
-		if ack.OK && msg.Type == uffdControlEvict {
-			select {
-			case s.evictions <- msg:
-			default:
-			}
-		}
-		if ack.OK && msg.Type == uffdControlProbe {
-			select {
-			case s.probes <- msg:
-			default:
-			}
-		}
+func (o sharedMemoryOpen) Close() {
+	if o.client != nil {
+		o.client.Close()
 	}
-}
-
-func (s *cooperativeSharedFaultSession) handleEvictControl(msg uffdControlMessage) uffdControlAck {
-	ack := uffdControlAck{Type: uffdControlEvictAck, RequestID: msg.RequestID, OK: true}
-	state := uffdClientActionState{
-		uffdFD:    s.uffdFD,
-		baseAddr:  s.baseAddr,
-		writeback: s.writeback,
-	}
-	if err := flushCooperativeEvictionRanges(s.mapped, state, msg.Ranges); err != nil {
-		ack.OK = false
-		ack.Error = err.Error()
-	}
-	return ack
-}
-
-func (s *cooperativeSharedFaultSession) handleProbeControl(msg uffdControlMessage) uffdControlAck {
-	ack := uffdControlAck{Type: uffdControlProbeAck, RequestID: msg.RequestID, OK: true}
-	state := uffdClientActionState{
-		uffdFD:    s.uffdFD,
-		baseAddr:  s.baseAddr,
-		writeback: s.writeback,
-	}
-	if err := dropCooperativeRanges(s.mapped, state, msg.Ranges); err != nil {
-		ack.OK = false
-		ack.Error = err.Error()
-	}
-	return ack
 }
 
 func flushCooperativeEvictionRanges(mapped []byte, state uffdClientActionState, ranges []uffdControlRange) error {
@@ -1778,152 +1681,26 @@ func shmOffsetForFileOffset(t testing.TB, extents []UFFDExtent, off uint64) uint
 
 func openSharedMemoryFile(t testing.TB, sock, filePath string, size uint64) (sharedMemoryOpen, error) {
 	t.Helper()
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
+	client, err := OpenRustMemory(sock, filePath, size)
 	if err != nil {
 		return sharedMemoryOpen{}, err
 	}
-	defer conn.Close()
-
-	payload, err := json.Marshal(UFFDRequest{Op: uffdOpOpenMemoryFile, Path: filePath, Size: size})
-	if err != nil {
-		return sharedMemoryOpen{}, err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, nil, nil); err != nil {
-		return sharedMemoryOpen{}, err
-	}
-
-	msg := make([]byte, uffdSocketPayloadSize)
-	oob := make([]byte, syscall.CmsgSpace(uffdFdSize))
-	n, oobn, flags, _, err := conn.ReadMsgUnix(msg, oob)
-	if err != nil {
-		return sharedMemoryOpen{}, err
-	}
-	if flags&unix.MSG_CTRUNC != 0 || flags&unix.MSG_TRUNC != 0 {
-		return sharedMemoryOpen{}, errors.New("truncated shared memory response")
-	}
-	var resp uffdResponse
-	if err := json.Unmarshal(msg[:n], &resp); err != nil {
-		return sharedMemoryOpen{}, err
-	}
-	if !resp.OK {
-		return sharedMemoryOpen{}, errors.New(resp.Error)
-	}
-	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
-	if err != nil {
-		return sharedMemoryOpen{}, err
-	}
-	var sharedMemoryFD = -1
-	for i := range msgs {
-		rights, err := syscall.ParseUnixRights(&msgs[i])
-		if err != nil {
-			return sharedMemoryOpen{}, err
-		}
-		if len(rights) != 1 {
-			for _, fd := range rights {
-				_ = unix.Close(fd)
-			}
-			return sharedMemoryOpen{}, errors.New("expected exactly one shared_memory_fd")
-		}
-		if sharedMemoryFD >= 0 {
-			_ = unix.Close(rights[0])
-			return sharedMemoryOpen{}, errors.New("received duplicate shared_memory_fd")
-		}
-		sharedMemoryFD = rights[0]
-	}
-	if sharedMemoryFD < 0 {
-		return sharedMemoryOpen{}, errors.New("missing shared_memory_fd")
-	}
-	return sharedMemoryOpen{fd: sharedMemoryFD, memoryID: resp.MemoryID, extents: resp.Extents}, nil
+	return sharedMemoryOpen{
+		client:   client,
+		fd:       client.SharedFD(),
+		memoryID: client.MemoryID(),
+		extents:  client.Extents(),
+		path:     filePath,
+	}, nil
 }
 
-func closeSharedMemoryFile(t testing.TB, sock, memoryID string) error {
-	t.Helper()
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	payload, err := json.Marshal(UFFDRequest{Op: uffdOpCloseMemoryFile, MemoryID: memoryID})
-	if err != nil {
-		return err
-	}
-	if _, _, err = conn.WriteMsgUnix(payload, nil, nil); err != nil {
-		return err
-	}
-	var resp uffdResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		return err
-	}
-	if !resp.OK {
-		return errors.New(resp.Error)
-	}
-	return nil
-}
-
-func requireCloseSharedMemoryFile(t testing.TB, sock, memoryID string) {
+func requireCloseSharedMemoryFile(t testing.TB, opened sharedMemoryOpen) {
 	t.Helper()
 	var err error
 	require.Eventually(t, func() bool {
-		err = closeSharedMemoryFile(t, sock, memoryID)
+		err = opened.client.CloseMemory()
 		return err == nil
 	}, 5*time.Second, 10*time.Millisecond, "last close_memory_file error: %v", err)
-}
-
-func mapSharedMemoryExtents(t testing.TB, fd int, size uint64, extents []UFFDExtent) ([]byte, func()) {
-	t.Helper()
-	reserve, err := unix.Mmap(-1, 0, int(size+uffdHugePageSize), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
-	require.NoError(t, err)
-	reserveBase := uintptr(unsafe.Pointer(&reserve[0]))
-	base := (reserveBase + uffdHugePageSize - 1) & ^(uintptr(uffdHugePageSize) - 1)
-	for _, extent := range extents {
-		require.Equal(t, uint64(0), extent.FileOffset%uffdHugePageSize)
-		require.Equal(t, uint64(0), extent.Length%uffdHugePageSize)
-		require.Equal(t, uint64(0), extent.ShmOffset%uffdHugePageSize)
-		addr := base + uintptr(extent.FileOffset)
-		_, _, errno := syscall.Syscall6(syscall.SYS_MMAP, addr, uintptr(extent.Length), uintptr(unix.PROT_READ|unix.PROT_WRITE), uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED), uintptr(fd), uintptr(extent.ShmOffset))
-		if errno != 0 {
-			_ = unix.Munmap(reserve)
-			skipUnavailableHugeTLB(t, errno)
-			t.Fatalf("mmap hugetlb shared extent: %s", errno)
-		}
-	}
-	mapped := unsafe.Slice((*byte)(unsafe.Pointer(base)), int(size))
-	cleanup := func() {
-		_ = unix.Munmap(reserve)
-	}
-	return mapped, cleanup
-}
-
-func registerHugeTLBUFFDRange(t testing.TB, mapped []byte) (int, func() error) {
-	t.Helper()
-	ensureUFFDTestSchedulerRoom(8)
-	fd, _, errno := syscall.Syscall(uintptr(nrUserfaultfd), uintptr(unix.O_CLOEXEC|unix.O_NONBLOCK), 0, 0)
-	if errno != 0 {
-		skipUnavailableUFFD(t, errno)
-		t.Fatalf("userfaultfd syscall: %s", errno)
-	}
-	api := newUFFDIOAPI(uint64(uffdAPI), uint64(uffdFeatureMissingHugetlbfs|uffdFeatureMinorHugetlbfs|uffdFeatureWPAsync))
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(uffdioAPIIoctl), uintptr(unsafe.Pointer(&api))); errno != 0 {
-		_ = unix.Close(int(fd))
-		skipUnavailableUFFD(t, errno)
-		t.Fatalf("UFFDIO_API hugetlb: %s", errno)
-	}
-	reg := newUFFDIORegister(uintptr(unsafe.Pointer(&mapped[0])), uintptr(len(mapped)), uint64(uffdioRegisterModeMissing|uffdioRegisterModeMinor|uffdioRegisterModeWP))
-	if _, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(uffdioRegisterIoctl), uintptr(unsafe.Pointer(&reg))); errno != 0 {
-		_ = unix.Close(int(fd))
-		skipUnavailableUFFD(t, errno)
-		t.Fatalf("UFFDIO_REGISTER hugetlb: %s", errno)
-	}
-	var once sync.Once
-	var closeErr error
-	closeFD := func() error {
-		once.Do(func() {
-			closeErr = unix.Close(int(fd))
-		})
-		return closeErr
-	}
-	return int(fd), closeFD
 }
 
 func ensureUFFDTestSchedulerRoom(minProcs int) {
@@ -1967,18 +1744,6 @@ func skipUnavailableHugeTLB(t testing.TB, err error) {
 	if reason := hugeTLBUnavailableReason(err); reason != "" {
 		t.Skip(reason)
 	}
-}
-
-func sendUFFDRequest(t testing.TB, sock string, fd int, req UFFDRequest) *net.UnixConn {
-	t.Helper()
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sock, Net: "unix"})
-	require.NoError(t, err)
-
-	payload, err := json.Marshal(req)
-	require.NoError(t, err)
-	_, _, err = conn.WriteMsgUnix(payload, syscall.UnixRights(fd), nil)
-	require.NoError(t, err)
-	return conn
 }
 
 func readMappedByte(t testing.TB, mapped []byte, idx int) byte {

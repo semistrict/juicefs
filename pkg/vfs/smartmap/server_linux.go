@@ -41,6 +41,7 @@ struct jfs_uffd_pagefault {
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -137,16 +138,11 @@ type UFFDRegion struct {
 }
 
 type UFFDRequest struct {
-	Op                  string       `json:"op,omitempty"`
-	Path                string       `json:"path,omitempty"`
-	Size                uint64       `json:"size,omitempty"`
-	MemoryID            string       `json:"memory_id,omitempty"`
-	MaxResidentPages    int          `json:"max_resident_pages,omitempty"`
-	EvictionPolicy      string       `json:"eviction_policy,omitempty"`
-	ProbeCandidatePages int          `json:"probe_candidate_pages,omitempty"`
-	ProbeEvictPages     int          `json:"probe_evict_pages,omitempty"`
-	ProbeMonitorMillis  int          `json:"probe_monitor_millis,omitempty"`
-	Mappings            []UFFDRegion `json:"mappings,omitempty"`
+	Op       string       `json:"op,omitempty"`
+	Path     string       `json:"path,omitempty"`
+	Size     uint64       `json:"size,omitempty"`
+	MemoryID string       `json:"memory_id,omitempty"`
+	Mappings []UFFDRegion `json:"mappings,omitempty"`
 }
 
 type UFFDExtent struct {
@@ -185,8 +181,16 @@ func findUFFDRegion(regions []UFFDRegion, addr uintptr) (*UFFDRegion, error) {
 
 // Start serves Smartmap UFFD memory requests for a mounted VFS instance on socketPath.
 func Start(v *vfs.VFS, socketPath string) (func(), error) {
+	return StartWithOptions(v, socketPath, Options{})
+}
+
+func StartWithOptions(v *vfs.VFS, socketPath string, options Options) (func(), error) {
 	if socketPath == "" {
 		return func() {}, nil
+	}
+	maxResidentPages, err := validateOptions(options)
+	if err != nil {
+		return nil, err
 	}
 	if st, err := os.Lstat(socketPath); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
@@ -209,7 +213,13 @@ func Start(v *vfs.VFS, socketPath string) (func(), error) {
 	}
 
 	done := make(chan struct{})
-	cache := newUFFDSharedCache()
+	cache := newUFFDSharedCache(uffdSharedCacheOptions{
+		maxResidentPages:    maxResidentPages,
+		evictionPolicy:      options.EvictionPolicy,
+		probeCandidatePages: options.ProbeCandidatePages,
+		probeEvictPages:     options.ProbeEvictPages,
+		probeMonitorMillis:  options.ProbeMonitorMillis,
+	})
 	var once sync.Once
 	var sessions sync.WaitGroup
 	var sessionsMu sync.Mutex
@@ -267,6 +277,37 @@ func Start(v *vfs.VFS, socketPath string) (func(), error) {
 	return stop, nil
 }
 
+func validateOptions(options Options) (int, error) {
+	switch options.EvictionPolicy {
+	case "", "lru", uffdEvictionPolicyProbe:
+	default:
+		return 0, fmt.Errorf("unsupported smartmap eviction policy: %s", options.EvictionPolicy)
+	}
+	if options.ProbeCandidatePages < 0 {
+		return 0, fmt.Errorf("probe candidate pages must be non-negative, got %d", options.ProbeCandidatePages)
+	}
+	if options.ProbeEvictPages < 0 {
+		return 0, fmt.Errorf("probe evict pages must be non-negative, got %d", options.ProbeEvictPages)
+	}
+	if options.ProbeMonitorMillis < 0 {
+		return 0, fmt.Errorf("probe monitor milliseconds must be non-negative, got %d", options.ProbeMonitorMillis)
+	}
+	if options.ResidentSize == 0 {
+		if options.EvictionPolicy == uffdEvictionPolicyProbe {
+			return 0, errors.New("probe eviction requires smartmap resident size")
+		}
+		return 0, nil
+	}
+	if options.ResidentSize%uffdHugePageSize != 0 {
+		return 0, fmt.Errorf("smartmap resident size must be a %d-byte multiple", uffdHugePageSize)
+	}
+	pages := options.ResidentSize / uffdHugePageSize
+	if pages > uint64(int(^uint(0)>>1)) {
+		return 0, fmt.Errorf("smartmap resident size is too large: %d", options.ResidentSize)
+	}
+	return int(pages), nil
+}
+
 func handleUFFDConn(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache) {
 	defer conn.Close()
 	req, fds, err := readUFFDRequest(conn)
@@ -294,7 +335,9 @@ func readUFFDRequest(conn *net.UnixConn) (UFFDRequest, []int, error) {
 		return UFFDRequest{}, nil, errors.New("smartmap socket payload truncated")
 	}
 	var req UFFDRequest
-	if err := json.Unmarshal(payload[:n], &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(payload[:n]))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		return UFFDRequest{}, nil, fmt.Errorf("parse uffd request: %w", err)
 	}
 	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
