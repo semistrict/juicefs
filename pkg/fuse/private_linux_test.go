@@ -308,7 +308,7 @@ func TestUFFDPrivatePeriodicWritebackCloneIsolationThroughMountedFuse(t *testing
 	)
 }
 
-func TestUFFDEvictionFlushesDirtyPrivatePageBeforeDropThroughMountedFuse(t *testing.T) {
+func TestUFFDPeriodicFlushPersistsDirtyPrivatePageAcrossEviction(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
 	}
@@ -321,14 +321,16 @@ func TestUFFDEvictionFlushesDirtyPrivatePageBeforeDropThroughMountedFuse(t *test
 
 	const privateByte = 0xc7
 	result := runFuseUFFDClient(t, fuseUFFDClientScript{
-		Sock:          sock,
-		Path:          "/vm-memory",
-		WritebackPath: memoryPath,
-		Size:          memorySize,
+		Sock:                sock,
+		Path:                "/vm-memory",
+		WritebackPath:       memoryPath,
+		Size:                memorySize,
+		FlushIntervalMillis: 10,
 		Actions: []fuseUFFDClientAction{
 			{Op: "read", Offset: 17, Want: fuseUFFDDeterministicByte(17)},
 			{Op: "write", Offset: 0, Value: privateByte},
 			{Op: "read", Offset: 0, Want: privateByte},
+			{Op: "sleep", Milliseconds: 50},
 			{Op: "read", Offset: fuseUFFDHugePageSize + 19, Want: fuseUFFDDeterministicByte(fuseUFFDHugePageSize + 19)},
 			{Op: "expect_eviction", Offset: 0},
 			{Op: "read", Offset: 0, Want: privateByte},
@@ -339,6 +341,37 @@ func TestUFFDEvictionFlushesDirtyPrivatePageBeforeDropThroughMountedFuse(t *test
 	requireFuseUFFDClientResult(t, result)
 	requireFuseFileByte(t, memoryPath, 0, privateByte)
 	requireFuseFileByte(t, memoryPath, 17, fuseUFFDDeterministicByte(17))
+}
+
+func TestUFFDEvictionPreservesClientFlushedWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{ResidentSize: fuseUFFDHugePageSize})
+	const memorySize = 2 * fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	const privateByte = 0xd4
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:                sock,
+		Path:                "/vm-memory",
+		WritebackPath:       memoryPath,
+		Size:                memorySize,
+		FlushIntervalMillis: 10,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "write", Offset: 0, Value: privateByte},
+			{Op: "sleep", Milliseconds: 50},
+			{Op: "read", Offset: fuseUFFDHugePageSize, Want: fuseUFFDDeterministicByte(fuseUFFDHugePageSize)},
+			{Op: "expect_eviction", Offset: 0},
+			{Op: "read", Offset: 0, Want: privateByte},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+	requireFuseFileByte(t, memoryPath, 0, privateByte)
 }
 
 func TestFUSEUFFDClientHelperProcess(t *testing.T) {
@@ -665,7 +698,7 @@ func fuseUFFDHugeTLBUnavailableReason(err error) string {
 }
 
 func (h *fuseRustSmartmapControlHandler) Evict(ranges []smartmap.RustControlRange) error {
-	msg, err := h.flushRanges(ranges)
+	msg, err := h.controlMessage(ranges)
 	if err != nil {
 		return err
 	}
@@ -681,7 +714,7 @@ func (h *fuseRustSmartmapControlHandler) Probe(ranges []smartmap.RustControlRang
 	return err
 }
 
-func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
 	msg := fuseUFFDControlMessage{Ranges: make([]fuseUFFDControlRange, 0, len(ranges))}
 	for _, r := range ranges {
 		if r.Length != fuseUFFDHugePageSize {
@@ -692,6 +725,16 @@ func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustContr
 			Length:     r.Length,
 			ShmOffset:  r.ShmOffset,
 		})
+	}
+	return msg, nil
+}
+
+func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+	msg, err := h.controlMessage(ranges)
+	if err != nil {
+		return msg, err
+	}
+	for _, r := range msg.Ranges {
 		if err := h.state.flushDirty(r.FileOffset, r.FileOffset+r.Length, true); err != nil {
 			return msg, err
 		}

@@ -34,9 +34,28 @@ fn main() -> juicefs_smartmap::Result<()> {
 }
 ```
 
-Dirty writeback policy intentionally belongs to the embedder. The control
-handler is where a VM runtime should flush dirty private pages through the
-mounted JuiceFS path before acknowledging an eviction.
+Dirty writeback policy intentionally belongs to the embedder. A VM runtime
+should flush dirty private pages through the mounted JuiceFS path on its own
+timer or policy; Smartmap eviction only drops shared clean backing on the
+server.
+
+## Read path
+
+Opening and mapping a Smartmap file does not read the file bytes from object
+storage. The server resolves the JuiceFS file, records the page layout, returns
+shared backing extents, and the client registers its private virtual range with
+its own `userfaultfd`. Object data is only needed after the client actually
+touches a page that is not already resident in the shared backing memory.
+
+When the client reads a byte at file offset `X`, the CPU first tries to satisfy
+the load from the client's private contiguous mapping. If that 2 MiB page is
+already present in the client, the load is just a normal memory read. If it is
+not present, the kernel reports a UFFD fault for that client mapping. The
+Smartmap server maps the fault address back to `X`, finds the corresponding
+2 MiB shared page, and either continues the fault to an already-populated shared
+page or reads that 2 MiB range from JuiceFS into the shared backing memory
+before continuing the fault. That JuiceFS read is the point where object storage
+may be reached if the data is not already cached locally.
 
 ## C ABI
 
@@ -47,7 +66,7 @@ The crate also exports a C ABI and installs declarations in
 #include "juicefs_smartmap.h"
 
 static int evict(void *userdata, const jfs_smartmap_range *ranges, size_t len) {
-  /* Flush dirty private pages through the mounted JuiceFS file. */
+  /* Record/acknowledge server shared-page eviction. Dirty writeback is separate. */
   return 0;
 }
 

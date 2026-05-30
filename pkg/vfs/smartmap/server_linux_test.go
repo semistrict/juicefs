@@ -1279,10 +1279,6 @@ type testRustSmartmapControlHandler struct {
 
 func (h *testRustSmartmapControlHandler) Evict(ranges []RustControlRange) error {
 	msg := h.controlMessage(uffdControlEvict, ranges)
-	state := uffdClientActionState{uffdFD: h.uffdFD, baseAddr: h.baseAddr, writeback: h.writeback}
-	if err := flushCooperativeEvictionRanges(h.mapped, state, msg.Ranges); err != nil {
-		return err
-	}
 	select {
 	case h.evictions <- msg:
 	default:
@@ -1646,10 +1642,6 @@ func (o sharedMemoryOpen) Close() {
 	if o.client != nil {
 		o.client.Close()
 	}
-}
-
-func flushCooperativeEvictionRanges(mapped []byte, state uffdClientActionState, ranges []uffdControlRange) error {
-	return dropCooperativeRanges(mapped, state, ranges)
 }
 
 func dropCooperativeRanges(mapped []byte, state uffdClientActionState, ranges []uffdControlRange) error {
