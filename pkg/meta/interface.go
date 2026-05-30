@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// SharedExtentSources is a message to locate source files for shared extent spans.
+	SharedExtentSources = 1009
 )
 
 const (

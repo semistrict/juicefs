@@ -564,6 +564,29 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put32(uint32(len(data)))
 		w.Put(data)
 		_, _ = out.Write(w.Bytes())
+	case meta.SharedExtentSources:
+		req, err := decodeSharedExtentSourcesRequest(r)
+		if err != nil {
+			logger.Warnf("invalid shared extent sources request: %s", err)
+			_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+			return
+		}
+		resp, eno := v.SharedExtentSources(ctx, req)
+		if eno != 0 {
+			_, _ = out.Write([]byte{byte(eno & 0xff)})
+			return
+		}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			logger.Errorf("marshal shared extent sources response: %v", err)
+			_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
+			return
+		}
+		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		_, _ = out.Write(w.Bytes())
 	case meta.CompactPath:
 		inode := Ino(r.Get64())
 		coCnt := r.Get16()

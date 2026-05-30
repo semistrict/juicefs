@@ -85,6 +85,7 @@ func Main(args []string) error {
 			cmdDebug(),
 			cmdClone(),
 			cmdSummary(),
+			cmdSharedExtentSources(),
 			cmdCompact(),
 			cmdTier(),
 		},
