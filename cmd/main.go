@@ -86,6 +86,7 @@ func Main(args []string) error {
 			cmdClone(),
 			cmdSummary(),
 			cmdSharedExtentSources(),
+			cmdGetMappingPlan(),
 			cmdCompact(),
 			cmdTier(),
 		},
