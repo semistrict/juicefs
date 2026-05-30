@@ -29,12 +29,22 @@ typedef struct jfs_smartmap_extent {
 typedef int (*jfs_smartmap_control_cb)(void *userdata,
                                        const jfs_smartmap_range *ranges,
                                        size_t len);
+typedef int (*jfs_smartmap_mutator_cb)(void *userdata);
+typedef int (*jfs_smartmap_page_synced_cb)(void *userdata, size_t offset);
 
 typedef struct jfs_smartmap_callbacks {
   void *userdata;
   jfs_smartmap_control_cb evict;
   jfs_smartmap_control_cb probe;
+  jfs_smartmap_control_cb write_fault;
 } jfs_smartmap_callbacks;
+
+typedef struct jfs_smartmap_sync_callbacks {
+  void *userdata;
+  jfs_smartmap_mutator_cb pause;
+  jfs_smartmap_mutator_cb resume;
+  jfs_smartmap_page_synced_cb page_synced;
+} jfs_smartmap_sync_callbacks;
 
 int jfs_smartmap_client_new(const char *socket,
                             jfs_smartmap_client **out,
@@ -60,6 +70,11 @@ int jfs_smartmap_map_private(const jfs_smartmap_memory *memory,
                              char **err);
 void *jfs_smartmap_mapping_ptr(const jfs_smartmap_mapping *mapping);
 size_t jfs_smartmap_mapping_len(const jfs_smartmap_mapping *mapping);
+int jfs_smartmap_mapping_sync(const jfs_smartmap_mapping *mapping,
+                              const jfs_smartmap_uffd *uffd,
+                              const char *writeback_path,
+                              const jfs_smartmap_sync_callbacks *callbacks,
+                              char **err);
 void jfs_smartmap_mapping_free(jfs_smartmap_mapping *mapping);
 
 int jfs_smartmap_create_uffd(const jfs_smartmap_memory *memory,

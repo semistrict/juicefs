@@ -672,7 +672,18 @@ func (s *uffdSharedSession) handleFault(pf *uffdPagefault) error {
 		return fmt.Errorf("fault file offset %d is outside shared memory layout", fileOff)
 	}
 	if pf.flags&uffdPagefaultFlagWP != 0 {
-		return fmt.Errorf("unexpected synchronous write-protect fault at file offset %d", fileOff)
+		ranges := []uffdControlRange{{
+			FileOffset: fileOff,
+			Length:     uffdHugePageSize,
+			ShmOffset:  page.shmOff,
+		}}
+		if err := s.requestWriteFault(ranges); err != nil {
+			return err
+		}
+		if err := uffdWriteProtect(s.uffdFd, pageAddr, uintptr(uffdHugePageSize), false); err != nil {
+			return err
+		}
+		return uffdWake(s.uffdFd, pageAddr, uintptr(uffdHugePageSize))
 	}
 	if pf.flags&uffdPagefaultFlagMinor != 0 {
 		s.cache.touchPage(page)
@@ -701,13 +712,6 @@ func (s *uffdSharedSession) continueCleanReadFault(pageAddr uintptr, pf *uffdPag
 		return nil
 	}
 	if err != nil {
-		return err
-	}
-	if err = uffdWriteProtect(s.uffdFd, pageAddr, uintptr(uffdHugePageSize), true); err != nil {
-		_ = uffdWake(s.uffdFd, pageAddr, uintptr(uffdHugePageSize))
-		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ESRCH) {
-			return nil
-		}
 		return err
 	}
 	return uffdWake(s.uffdFd, pageAddr, uintptr(uffdHugePageSize))
@@ -1213,6 +1217,11 @@ func (s *uffdSharedSession) requestEviction(ranges []uffdControlRange) error {
 
 func (s *uffdSharedSession) requestProbe(ranges []uffdControlRange) error {
 	_, err := s.requestControl(uffdControlProbe, uffdControlProbeAck, ranges)
+	return err
+}
+
+func (s *uffdSharedSession) requestWriteFault(ranges []uffdControlRange) error {
+	_, err := s.requestControl(uffdControlWriteFault, uffdControlWriteFaultAck, ranges)
 	return err
 }
 

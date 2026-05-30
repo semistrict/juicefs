@@ -37,7 +37,13 @@ fn main() -> juicefs_smartmap::Result<()> {
 Dirty writeback policy intentionally belongs to the embedder. A VM runtime
 should flush dirty private pages through the mounted JuiceFS path on its own
 timer or policy; Smartmap eviction only drops shared clean backing on the
-server.
+server. `Mapping::sync_dirty` pauses the mutator only long enough to find and
+write-protect dirty pages, then resumes the mutator while the dirty pages are
+written through the mounted JuiceFS path. If the mutator writes a protected page
+before the background copy reaches it, the server forwards a synchronous
+`write_fault` control message; the client flushes that page, then the server
+unprotects and wakes the blocked write. In Firecracker, the pause/resume hooks
+are where the VM should stop and start vCPUs around the snapshot step.
 
 ## Read path
 
@@ -70,6 +76,16 @@ static int evict(void *userdata, const jfs_smartmap_range *ranges, size_t len) {
   return 0;
 }
 
+static int pause_mutator(void *userdata) {
+  /* Pause the VM/vCPUs before dirty-page sync. */
+  return 0;
+}
+
+static int resume_mutator(void *userdata) {
+  /* Resume the VM/vCPUs after dirty-page sync. */
+  return 0;
+}
+
 int open_vm_memory(void) {
   char *err = NULL;
   jfs_smartmap_client *client = NULL;
@@ -92,7 +108,15 @@ int open_vm_memory(void) {
   (void)base;
   (void)len;
 
-  jfs_smartmap_callbacks callbacks = {.userdata = NULL, .evict = evict, .probe = NULL};
+  jfs_smartmap_sync_callbacks sync_callbacks = {
+      .userdata = NULL,
+      .pause = pause_mutator,
+      .resume = resume_mutator,
+      .page_synced = NULL};
+  if (jfs_smartmap_mapping_sync(mapping, uffd, "/jfs/vm-memory", &sync_callbacks, &err) != 0) goto fail;
+
+  jfs_smartmap_callbacks callbacks = {
+      .userdata = NULL, .evict = evict, .probe = NULL, .write_fault = NULL};
   return jfs_smartmap_run_control_loop(session, &callbacks, &err);
 
   /* Event-loop embedders can instead call one control step at a time:

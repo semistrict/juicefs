@@ -9,6 +9,8 @@ pub const CONTROL_EVICT: &str = "evict";
 pub const CONTROL_EVICT_ACK: &str = "evict_ack";
 pub const CONTROL_PROBE: &str = "probe";
 pub const CONTROL_PROBE_ACK: &str = "probe_ack";
+pub const CONTROL_WRITE_FAULT: &str = "write_fault";
+pub const CONTROL_WRITE_FAULT_ACK: &str = "write_fault_ack";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Extent {
@@ -106,6 +108,7 @@ impl ControlMessage {
     pub fn ack(&self, ok: bool, err: Option<io::Error>) -> ControlAck {
         let kind = match self.kind.as_str() {
             CONTROL_PROBE => CONTROL_PROBE_ACK,
+            CONTROL_WRITE_FAULT => CONTROL_WRITE_FAULT_ACK,
             _ => CONTROL_EVICT_ACK,
         };
         ControlAck {

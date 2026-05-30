@@ -525,13 +525,13 @@ func drainFd(fd int) {
 }
 
 func socketClosed(fd int) (bool, error) {
-	var buf [1]byte
+	var buf [256]byte
 	n, _, _, _, err := unix.Recvmsg(fd, buf[:], nil, unix.MSG_PEEK|unix.MSG_DONTWAIT)
 	if err == nil {
 		if n == 0 {
 			return true, nil
 		}
-		return false, errors.New("unexpected data on uffd request socket")
+		return false, fmt.Errorf("unexpected data on uffd request socket: %q", string(buf[:n]))
 	}
 	if err == unix.ECONNRESET || err == unix.ENOTCONN {
 		return true, nil

@@ -12,6 +12,10 @@ package smartmap
 
 extern int goSmartmapEvict(void *userdata, jfs_smartmap_range *ranges, size_t len);
 extern int goSmartmapProbe(void *userdata, jfs_smartmap_range *ranges, size_t len);
+extern int goSmartmapWriteFault(void *userdata, jfs_smartmap_range *ranges, size_t len);
+extern int goSmartmapPauseMutator(void *userdata);
+extern int goSmartmapResumeMutator(void *userdata);
+extern int goSmartmapPageSynced(void *userdata, size_t offset);
 */
 import "C"
 
@@ -33,6 +37,13 @@ type RustControlRange struct {
 type RustControlHandler interface {
 	Evict([]RustControlRange) error
 	Probe([]RustControlRange) error
+	WriteFault([]RustControlRange) error
+}
+
+type RustSyncHandler interface {
+	PauseMutator() error
+	ResumeMutator() error
+	PageSynced(offset uint64) error
 }
 
 type RustClient struct {
@@ -194,6 +205,39 @@ func (c *RustClient) CloseFaults() {
 	}
 }
 
+func (c *RustClient) Sync(writebackPath string, handler RustSyncHandler) error {
+	if c.mapping == nil || c.uffd == nil {
+		return errors.New("rust smartmap sync requires an active mapping and uffd")
+	}
+	if writebackPath == "" {
+		return errors.New("rust smartmap sync requires writeback path")
+	}
+	pathC := C.CString(writebackPath)
+	defer C.free(unsafe.Pointer(pathC))
+
+	var handle *cgo.Handle
+	if handler != nil {
+		h := cgo.NewHandle(handler)
+		handle = &h
+		defer h.Delete()
+	}
+	var userdata unsafe.Pointer
+	if handle != nil {
+		userdata = unsafe.Pointer(uintptr(*handle))
+	}
+	callbacks := C.jfs_smartmap_sync_callbacks{
+		userdata:    userdata,
+		pause:       (C.jfs_smartmap_mutator_cb)(C.goSmartmapPauseMutator),
+		resume:      (C.jfs_smartmap_mutator_cb)(C.goSmartmapResumeMutator),
+		page_synced: (C.jfs_smartmap_page_synced_cb)(C.goSmartmapPageSynced),
+	}
+	var err *C.char
+	if C.jfs_smartmap_mapping_sync(c.mapping, c.uffd, pathC, &callbacks, &err) != 0 {
+		return takeRustSmartmapError(err)
+	}
+	return nil
+}
+
 func (c *RustClient) ServeControls() {
 	if c.handle == nil {
 		return
@@ -201,9 +245,10 @@ func (c *RustClient) ServeControls() {
 	c.controlsStarted = true
 	defer close(c.controlsDone)
 	callbacks := C.jfs_smartmap_callbacks{
-		userdata: unsafe.Pointer(uintptr(*c.handle)),
-		evict:    (C.jfs_smartmap_control_cb)(C.goSmartmapEvict),
-		probe:    (C.jfs_smartmap_control_cb)(C.goSmartmapProbe),
+		userdata:    unsafe.Pointer(uintptr(*c.handle)),
+		evict:       (C.jfs_smartmap_control_cb)(C.goSmartmapEvict),
+		probe:       (C.jfs_smartmap_control_cb)(C.goSmartmapProbe),
+		write_fault: (C.jfs_smartmap_control_cb)(C.goSmartmapWriteFault),
 	}
 	for {
 		var handled C.int
@@ -276,15 +321,20 @@ func peekRustSmartmapError(err *C.char) string {
 
 //export goSmartmapEvict
 func goSmartmapEvict(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t) C.int {
-	return goSmartmapControl(userdata, ranges, length, true)
+	return goSmartmapControl(userdata, ranges, length, "evict")
 }
 
 //export goSmartmapProbe
 func goSmartmapProbe(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t) C.int {
-	return goSmartmapControl(userdata, ranges, length, false)
+	return goSmartmapControl(userdata, ranges, length, "probe")
 }
 
-func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t, evict bool) C.int {
+//export goSmartmapWriteFault
+func goSmartmapWriteFault(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t) C.int {
+	return goSmartmapControl(userdata, ranges, length, "write_fault")
+}
+
+func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t, kind string) C.int {
 	if userdata == nil {
 		return -1
 	}
@@ -302,10 +352,60 @@ func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, le
 		})
 	}
 	var err error
-	if evict {
+	switch kind {
+	case "evict":
 		err = handler.Evict(goRanges)
-	} else {
+	case "probe":
 		err = handler.Probe(goRanges)
+	case "write_fault":
+		err = handler.WriteFault(goRanges)
+	default:
+		return -1
+	}
+	if err != nil {
+		return -1
+	}
+	return 0
+}
+
+//export goSmartmapPauseMutator
+func goSmartmapPauseMutator(userdata unsafe.Pointer) C.int {
+	return goSmartmapMutator(userdata, true)
+}
+
+//export goSmartmapResumeMutator
+func goSmartmapResumeMutator(userdata unsafe.Pointer) C.int {
+	return goSmartmapMutator(userdata, false)
+}
+
+//export goSmartmapPageSynced
+func goSmartmapPageSynced(userdata unsafe.Pointer, offset C.size_t) C.int {
+	if userdata == nil {
+		return 0
+	}
+	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustSyncHandler)
+	if !ok || handler == nil {
+		return -1
+	}
+	if err := handler.PageSynced(uint64(offset)); err != nil {
+		return -1
+	}
+	return 0
+}
+
+func goSmartmapMutator(userdata unsafe.Pointer, pause bool) C.int {
+	if userdata == nil {
+		return 0
+	}
+	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustSyncHandler)
+	if !ok || handler == nil {
+		return -1
+	}
+	var err error
+	if pause {
+		err = handler.PauseMutator()
+	} else {
+		err = handler.ResumeMutator()
 	}
 	if err != nil {
 		return -1

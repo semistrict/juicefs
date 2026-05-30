@@ -8,7 +8,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use crate::{
-    Client, ControlHandler, ControlRange, FaultSession, Mapping, Memory, Result, UserfaultFd,
+    Client, ControlHandler, ControlRange, FaultSession, Mapping, Memory, MutatorHooks, Result,
+    UserfaultFd,
 };
 
 #[repr(C)]
@@ -44,6 +45,21 @@ pub struct jfs_smartmap_callbacks {
             len: usize,
         ) -> c_int,
     >,
+    pub write_fault: Option<
+        unsafe extern "C" fn(
+            userdata: *mut c_void,
+            ranges: *const jfs_smartmap_range,
+            len: usize,
+        ) -> c_int,
+    >,
+}
+
+#[repr(C)]
+pub struct jfs_smartmap_sync_callbacks {
+    pub userdata: *mut c_void,
+    pub pause: Option<unsafe extern "C" fn(userdata: *mut c_void) -> c_int>,
+    pub resume: Option<unsafe extern "C" fn(userdata: *mut c_void) -> c_int>,
+    pub page_synced: Option<unsafe extern "C" fn(userdata: *mut c_void, offset: usize) -> c_int>,
 }
 
 pub struct jfs_smartmap_client {
@@ -232,6 +248,26 @@ pub extern "C" fn jfs_smartmap_mapping_len(mapping: *const jfs_smartmap_mapping)
 }
 
 #[no_mangle]
+pub extern "C" fn jfs_smartmap_mapping_sync(
+    mapping: *const jfs_smartmap_mapping,
+    uffd: *const jfs_smartmap_uffd,
+    writeback_path: *const c_char,
+    callbacks: *const jfs_smartmap_sync_callbacks,
+    err: *mut *mut c_char,
+) -> c_int {
+    ffi_result(err, || {
+        let mapping = unsafe_ref(mapping, "mapping")?;
+        let uffd = unsafe_ref(uffd, "uffd")?;
+        let writeback_path = cstr(writeback_path)?;
+        let callbacks = unsafe_ref(callbacks, "callbacks")?;
+        let mut hooks = FfiMutatorHooks { callbacks };
+        mapping
+            .inner
+            .sync_dirty(&uffd.inner, writeback_path, &mut hooks)
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn jfs_smartmap_mapping_free(mapping: *mut jfs_smartmap_mapping) {
     free_box(mapping);
 }
@@ -404,6 +440,10 @@ struct FfiHandler<'a> {
     callbacks: &'a jfs_smartmap_callbacks,
 }
 
+struct FfiMutatorHooks<'a> {
+    callbacks: &'a jfs_smartmap_sync_callbacks,
+}
+
 impl ControlHandler for FfiHandler<'_> {
     fn evict(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
         call_control(self.callbacks, self.callbacks.evict, ranges)
@@ -412,6 +452,29 @@ impl ControlHandler for FfiHandler<'_> {
     fn probe(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
         let cb = self.callbacks.probe.or(self.callbacks.evict);
         call_control(self.callbacks, cb, ranges)
+    }
+
+    fn write_fault(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
+        let cb = self
+            .callbacks
+            .write_fault
+            .or(self.callbacks.probe)
+            .or(self.callbacks.evict);
+        call_control(self.callbacks, cb, ranges)
+    }
+}
+
+impl MutatorHooks for FfiMutatorHooks<'_> {
+    fn pause(&mut self) -> Result<()> {
+        call_mutator(self.callbacks, self.callbacks.pause, "pause")
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        call_mutator(self.callbacks, self.callbacks.resume, "resume")
+    }
+
+    fn page_synced(&mut self, offset: usize) -> Result<()> {
+        call_page_synced(self.callbacks, offset)
     }
 }
 
@@ -439,6 +502,38 @@ fn call_control(
             io::ErrorKind::Other,
             format!("Smartmap control callback failed with {rc}"),
         ))
+    }
+}
+
+fn call_mutator(
+    callbacks: &jfs_smartmap_sync_callbacks,
+    cb: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    name: &str,
+) -> Result<()> {
+    let Some(cb) = cb else {
+        return Ok(());
+    };
+    let rc = unsafe { cb(callbacks.userdata) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(crate::Error::Protocol(format!(
+            "Smartmap mutator {name} callback failed with {rc}"
+        )))
+    }
+}
+
+fn call_page_synced(callbacks: &jfs_smartmap_sync_callbacks, offset: usize) -> Result<()> {
+    let Some(cb) = callbacks.page_synced else {
+        return Ok(());
+    };
+    let rc = unsafe { cb(callbacks.userdata, offset) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(crate::Error::Protocol(format!(
+            "Smartmap page_synced callback failed with {rc}"
+        )))
     }
 }
 

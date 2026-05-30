@@ -6,10 +6,10 @@ use crate::{Result, HUGE_PAGE_SIZE};
 const UFFD_API: u64 = 0xAA;
 const UFFD_FEATURE_MISSING_HUGETLBFS: u64 = 1 << 4;
 const UFFD_FEATURE_MINOR_HUGETLBFS: u64 = 1 << 9;
-const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
 const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
+const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1 << 0;
 
 const IOC_NRBITS: u64 = 8;
 const IOC_TYPEBITS: u64 = 8;
@@ -41,6 +41,12 @@ struct UffdioRegister {
     ioctls: u64,
 }
 
+#[repr(C)]
+struct UffdioWriteProtect {
+    range: UffdioRange,
+    mode: u64,
+}
+
 pub struct UserfaultFd {
     fd: OwnedFd,
 }
@@ -66,9 +72,7 @@ impl UserfaultFd {
         let fd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
         let mut api = UffdioApi {
             api: UFFD_API,
-            features: UFFD_FEATURE_MISSING_HUGETLBFS
-                | UFFD_FEATURE_MINOR_HUGETLBFS
-                | UFFD_FEATURE_WP_ASYNC,
+            features: UFFD_FEATURE_MISSING_HUGETLBFS | UFFD_FEATURE_MINOR_HUGETLBFS,
             ioctls: 0,
         };
         ioctl(fd.as_raw_fd(), uffdio_api_ioctl(), &mut api)?;
@@ -84,6 +88,22 @@ impl UserfaultFd {
         };
         ioctl(fd.as_raw_fd(), uffdio_register_ioctl(), &mut reg)?;
         Ok(Self { fd })
+    }
+
+    pub fn write_protect(&self, addr: usize, len: usize, protect: bool) -> Result<()> {
+        let mut wp = UffdioWriteProtect {
+            range: UffdioRange {
+                start: addr as u64,
+                len: len as u64,
+            },
+            mode: if protect {
+                UFFDIO_WRITEPROTECT_MODE_WP
+            } else {
+                0
+            },
+        };
+        ioctl(self.fd.as_raw_fd(), uffdio_writeprotect_ioctl(), &mut wp)?;
+        Ok(())
     }
 }
 
@@ -115,4 +135,8 @@ const fn uffdio_api_ioctl() -> u64 {
 
 const fn uffdio_register_ioctl() -> u64 {
     iowr(0x00, std::mem::size_of::<UffdioRegister>() as u64)
+}
+
+const fn uffdio_writeprotect_ioctl() -> u64 {
+    iowr(0x06, std::mem::size_of::<UffdioWriteProtect>() as u64)
 }

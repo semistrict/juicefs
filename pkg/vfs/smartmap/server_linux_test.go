@@ -1299,6 +1299,10 @@ func (h *testRustSmartmapControlHandler) Probe(ranges []RustControlRange) error 
 	return nil
 }
 
+func (h *testRustSmartmapControlHandler) WriteFault(ranges []RustControlRange) error {
+	return nil
+}
+
 func (h *testRustSmartmapControlHandler) controlMessage(kind string, ranges []RustControlRange) uffdControlMessage {
 	msg := uffdControlMessage{Type: kind, RequestID: 1}
 	for _, r := range ranges {

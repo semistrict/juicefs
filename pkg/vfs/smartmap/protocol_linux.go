@@ -24,10 +24,12 @@ package smartmap
 const (
 	uffdEvictionPolicyProbe = "probe"
 
-	uffdControlEvict    = "evict"
-	uffdControlEvictAck = "evict_ack"
-	uffdControlProbe    = "probe"
-	uffdControlProbeAck = "probe_ack"
+	uffdControlEvict         = "evict"
+	uffdControlEvictAck      = "evict_ack"
+	uffdControlProbe         = "probe"
+	uffdControlProbeAck      = "probe_ack"
+	uffdControlWriteFault    = "write_fault"
+	uffdControlWriteFaultAck = "write_fault_ack"
 )
 
 type uffdControlRange struct {

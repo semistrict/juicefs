@@ -9,12 +9,12 @@ pub mod ffi;
 
 use std::fs::File;
 use std::io;
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::net::Shutdown;
 
-pub use mapping::Mapping;
+pub use mapping::{Mapping, MutatorHooks, NoopMutatorHooks};
 pub use protocol::{ControlMessage, ControlRange, Extent};
 pub use uffd::UserfaultFd;
 
@@ -157,6 +157,10 @@ pub trait ControlHandler {
     fn probe(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
         self.evict(ranges)
     }
+
+    fn write_fault(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
+        self.probe(ranges)
+    }
 }
 
 pub struct FaultSession {
@@ -175,9 +179,13 @@ impl FaultSession {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
             Err(e) => return Err(e.into()),
         };
+        if msg.kind.is_empty() {
+            return Ok(false);
+        }
         let result = match msg.kind.as_str() {
             protocol::CONTROL_EVICT => handler.evict(&msg.ranges),
             protocol::CONTROL_PROBE => handler.probe(&msg.ranges),
+            protocol::CONTROL_WRITE_FAULT => handler.write_fault(&msg.ranges),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported Smartmap control message {other}"),

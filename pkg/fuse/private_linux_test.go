@@ -33,6 +33,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -96,6 +97,7 @@ type fuseUFFDClientScript struct {
 	Sock                string                 `json:"sock"`
 	Path                string                 `json:"path"`
 	WritebackPath       string                 `json:"writeback_path"`
+	AlternatePath       string                 `json:"alternate_path,omitempty"`
 	Size                uint64                 `json:"size"`
 	FlushIntervalMillis int                    `json:"flush_interval_millis,omitempty"`
 	Actions             []fuseUFFDClientAction `json:"actions"`
@@ -106,6 +108,8 @@ type fuseUFFDClientAction struct {
 	Offset       uint64 `json:"offset,omitempty"`
 	Value        byte   `json:"value,omitempty"`
 	Want         byte   `json:"want,omitempty"`
+	Count        int    `json:"count,omitempty"`
+	UseAlternate bool   `json:"use_alternate,omitempty"`
 	Milliseconds int    `json:"milliseconds,omitempty"`
 }
 
@@ -138,11 +142,26 @@ type fuseUFFDClientState struct {
 	uffdFD    int
 	baseAddr  uintptr
 	writeback string
+	alternate string
+	client    *smartmap.RustClient
 	evictions chan fuseUFFDControlMessage
+	mu        sync.Mutex
+	cond      *sync.Cond
+	pauses    int
+	resumes   int
+	syncing   bool
+	synced    map[uint64]bool
+	resume    *fuseUFFDResumeWrite
 }
 
 type fuseRustSmartmapControlHandler struct {
 	state *fuseUFFDClientState
+}
+
+type fuseUFFDResumeWrite struct {
+	offset uint64
+	value  byte
+	done   chan error
 }
 
 func TestUFFDPrivatePeriodicWritebackThroughMountedFuse(t *testing.T) {
@@ -374,6 +393,151 @@ func TestUFFDEvictionPreservesClientFlushedWrite(t *testing.T) {
 	requireFuseFileByte(t, memoryPath, 0, privateByte)
 }
 
+func TestUFFDSyncPausesMutatorAndFlushesDirtyPrivatePage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+	const memorySize = fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	const privateByte = 0x9a
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		Size:          memorySize,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "write", Offset: 0, Value: privateByte},
+			{Op: "sync"},
+			{Op: "expect_pause_count", Count: 1},
+			{Op: "read", Offset: 0, Want: privateByte},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+	requireFuseFileByte(t, memoryPath, 0, privateByte)
+}
+
+func TestUFFDSyncResumesMutatorOnWritebackError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+	const memorySize = fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		AlternatePath: filepath.Join(mp, "missing-memory"),
+		Size:          memorySize,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "write", Offset: 0, Value: 0xa1},
+			{Op: "sync_expect_error"},
+			{Op: "expect_pause_count", Count: 1},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+}
+
+func TestUFFDSyncFlushesOnlyPagesDirtyAtSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+	const memorySize = 2 * fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	const firstByte = 0xb1
+	const secondByte = 0xb2
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		Size:          memorySize,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "read", Offset: fuseUFFDHugePageSize, Want: fuseUFFDDeterministicByte(fuseUFFDHugePageSize)},
+			{Op: "write", Offset: 0, Value: firstByte},
+			{Op: "sync"},
+			{Op: "write", Offset: fuseUFFDHugePageSize, Value: secondByte},
+			{Op: "expect_file_byte", Offset: 0, Want: firstByte},
+			{Op: "expect_file_byte", Offset: fuseUFFDHugePageSize, Want: fuseUFFDDeterministicByte(fuseUFFDHugePageSize)},
+			{Op: "sync"},
+			{Op: "expect_file_byte", Offset: fuseUFFDHugePageSize, Want: secondByte},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+}
+
+func TestUFFDSyncWriteDuringBackgroundFlushIsNextGenerationDirty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+	const memorySize = fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	const firstByte = 0xd1
+	const secondByte = 0xd2
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		Size:          memorySize,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "write", Offset: 0, Value: firstByte},
+			{Op: "sync_with_resume_write", Offset: 0, Value: secondByte},
+			{Op: "expect_file_byte", Offset: 0, Want: firstByte},
+			{Op: "read", Offset: 0, Want: secondByte},
+			{Op: "sync"},
+			{Op: "expect_file_byte", Offset: 0, Want: secondByte},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+}
+
+func TestUFFDNormalWriteProtectFaultDoesNotWriteBack(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real FUSE/userfaultfd integration test in short mode")
+	}
+
+	tmp := t.TempDir()
+	mp, sock := setupFuseUFFDMountWithOptions(t, tmp, smartmap.Options{})
+	const memorySize = fuseUFFDHugePageSize
+	memoryPath := filepath.Join(mp, "vm-memory")
+	writeFuseUFFDFile(t, memoryPath, memorySize)
+
+	result := runFuseUFFDClient(t, fuseUFFDClientScript{
+		Sock:          sock,
+		Path:          "/vm-memory",
+		WritebackPath: memoryPath,
+		Size:          memorySize,
+		Actions: []fuseUFFDClientAction{
+			{Op: "read", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+			{Op: "write", Offset: 0, Value: 0xc1},
+			{Op: "expect_file_byte", Offset: 0, Want: fuseUFFDDeterministicByte(0)},
+		},
+	})
+	requireFuseUFFDClientResult(t, result)
+}
+
 func TestFUSEUFFDClientHelperProcess(t *testing.T) {
 	if os.Getenv(fuseUFFDHelperEnv) != "1" {
 		return
@@ -577,13 +741,23 @@ func readFuseControlStatus(t testing.TB, control *os.File) syscall.Errno {
 
 func requireFuseFileByte(t testing.TB, path string, off uint64, want byte) {
 	t.Helper()
-	file, err := os.Open(path)
+	got, err := readFileByte(path, off)
 	require.NoError(t, err)
+	require.Equal(t, want, got, "byte at offset %d", off)
+}
+
+func readFileByte(path string, off uint64) (byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
 	defer file.Close()
 	var got [1]byte
 	_, err = file.ReadAt(got[:], int64(off))
-	require.NoError(t, err)
-	require.Equal(t, want, got[0], "byte at offset %d", off)
+	if err != nil {
+		return 0, err
+	}
+	return got[0], nil
 }
 
 func fuseUFFDDeterministicByte(i int) byte {
@@ -629,6 +803,7 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 	}()
 	state := &fuseUFFDClientState{
 		writeback: script.WritebackPath,
+		alternate: script.AlternatePath,
 		evictions: make(chan fuseUFFDControlMessage, 8),
 	}
 	handler := &fuseRustSmartmapControlHandler{state: state}
@@ -640,6 +815,7 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 		return fuseUFFDClientResult{Error: err.Error()}
 	}
 	defer client.Close()
+	state.client = client
 	state.mapped = client.Mapped()
 	state.uffdFD = client.UffdFD()
 	state.baseAddr = client.BaseAddr()
@@ -714,6 +890,25 @@ func (h *fuseRustSmartmapControlHandler) Probe(ranges []smartmap.RustControlRang
 	return err
 }
 
+func (h *fuseRustSmartmapControlHandler) WriteFault(ranges []smartmap.RustControlRange) error {
+	h.state.mu.Lock()
+	defer h.state.mu.Unlock()
+	for h.state.syncing {
+		allSynced := true
+		for _, r := range ranges {
+			if !h.state.synced[r.FileOffset] {
+				allSynced = false
+				break
+			}
+		}
+		if allSynced {
+			return nil
+		}
+		h.state.cond.Wait()
+	}
+	return nil
+}
+
 func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
 	msg := fuseUFFDControlMessage{Ranges: make([]fuseUFFDControlRange, 0, len(ranges))}
 	for _, r := range ranges {
@@ -730,12 +925,16 @@ func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []smartmap.RustCo
 }
 
 func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+	return h.flushRangesWithDrop(ranges, true)
+}
+
+func (h *fuseRustSmartmapControlHandler) flushRangesWithDrop(ranges []smartmap.RustControlRange, drop bool) (fuseUFFDControlMessage, error) {
 	msg, err := h.controlMessage(ranges)
 	if err != nil {
 		return msg, err
 	}
 	for _, r := range msg.Ranges {
-		if err := h.state.flushDirty(r.FileOffset, r.FileOffset+r.Length, true); err != nil {
+		if err := h.state.flushDirty(r.FileOffset, r.FileOffset+r.Length, drop); err != nil {
 			return msg, err
 		}
 	}
@@ -756,7 +955,7 @@ func (s *fuseUFFDClientState) startPeriodicFlush(interval time.Duration) func() 
 		for {
 			select {
 			case <-ticker.C:
-				if err := s.flushDirty(0, uint64(len(s.mapped)), false); err != nil {
+				if err := s.syncDirty(); err != nil {
 					select {
 					case errs <- err:
 					default:
@@ -799,6 +998,34 @@ func (s *fuseUFFDClientState) runActions(actions []fuseUFFDClientAction) error {
 			if err := s.expectEviction(action.Offset); err != nil {
 				return err
 			}
+		case "sync":
+			if err := s.syncDirty(); err != nil {
+				return err
+			}
+		case "sync_with_resume_write":
+			if err := s.syncWithResumeWrite(action.Offset, action.Value); err != nil {
+				return err
+			}
+		case "sync_expect_error":
+			if err := s.syncPath(s.alternate); err == nil {
+				return errors.New("sync unexpectedly succeeded")
+			}
+		case "expect_pause_count":
+			if got := s.pauseCount(); got != action.Count {
+				return fmt.Errorf("pause count got %d want %d", got, action.Count)
+			}
+		case "expect_file_byte":
+			p := s.writeback
+			if action.UseAlternate {
+				p = s.alternate
+			}
+			got, err := readFileByte(p, action.Offset)
+			if err != nil {
+				return err
+			}
+			if got != action.Want {
+				return fmt.Errorf("file byte at %d got %d want %d", action.Offset, got, action.Want)
+			}
 		case "sleep":
 			time.Sleep(time.Duration(action.Milliseconds) * time.Millisecond)
 		default:
@@ -806,6 +1033,109 @@ func (s *fuseUFFDClientState) runActions(actions []fuseUFFDClientAction) error {
 		}
 	}
 	return nil
+}
+
+func (s *fuseUFFDClientState) syncDirty() error {
+	return s.syncPath(s.writeback)
+}
+
+func (s *fuseUFFDClientState) syncWithResumeWrite(off uint64, value byte) error {
+	resume := &fuseUFFDResumeWrite{offset: off, value: value, done: make(chan error, 1)}
+	s.mu.Lock()
+	s.resume = resume
+	s.mu.Unlock()
+	err := s.syncDirty()
+	s.mu.Lock()
+	if s.resume == resume {
+		s.resume = nil
+	}
+	s.mu.Unlock()
+	select {
+	case writeErr := <-resume.done:
+		if err != nil {
+			return err
+		}
+		return writeErr
+	case <-time.After(5 * time.Second):
+		if err != nil {
+			return err
+		}
+		return errors.New("timed out waiting for resume write")
+	}
+}
+
+func (s *fuseUFFDClientState) syncPath(path string) error {
+	if s.client == nil {
+		return errors.New("smartmap client is missing")
+	}
+	s.mu.Lock()
+	s.syncing = true
+	s.synced = make(map[uint64]bool)
+	if s.cond == nil {
+		s.cond = sync.NewCond(&s.mu)
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.syncing = false
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	}()
+	return s.client.Sync(path, s)
+}
+
+func (s *fuseUFFDClientState) PauseMutator() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pauses++
+	return nil
+}
+
+func (s *fuseUFFDClientState) ResumeMutator() error {
+	s.mu.Lock()
+	s.resumes++
+	resume := s.resume
+	s.resume = nil
+	mapped := s.mapped
+	s.mu.Unlock()
+	if resume != nil {
+		go func() {
+			idx, err := checkedFuseMappedIndex(mapped, resume.offset)
+			if err == nil {
+				mapped[idx] = resume.value
+			}
+			resume.done <- err
+		}()
+	}
+	return nil
+}
+
+func (s *fuseUFFDClientState) PageSynced(offset uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.synced != nil {
+		s.synced[offset] = true
+	}
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
+	return nil
+}
+
+func checkedFuseMappedIndex(mapped []byte, off uint64) (int, error) {
+	if off >= uint64(len(mapped)) {
+		return 0, fmt.Errorf("mapped offset %d is outside range length %d", off, len(mapped))
+	}
+	return int(off), nil
+}
+
+func (s *fuseUFFDClientState) pauseCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pauses != s.resumes {
+		return -1
+	}
+	return s.pauses
 }
 
 func (s *fuseUFFDClientState) expectEviction(off uint64) error {
