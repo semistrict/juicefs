@@ -10,13 +10,14 @@ pub mod ffi;
 use std::fs::File;
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-pub use mapping::{Mapping, MutatorHooks, NoopMutatorHooks};
-pub use protocol::{ControlMessage, ControlRange, Extent};
-pub use uffd::UserfaultFd;
+use mapping::Mapping;
+pub use mapping::{MutatorHooks, NoopMutatorHooks};
+pub use protocol::{ControlRange, Extent};
+use uffd::UserfaultFd;
 
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
@@ -44,163 +45,182 @@ impl Client {
         }
     }
 
-    pub fn open_memory_file(&self, path: impl Into<String>, size: u64) -> Result<Memory> {
+    pub fn open_mapping(&self, path: impl Into<String>, size: u64) -> Result<SmartMapping> {
         if size == 0 || size % HUGE_PAGE_SIZE != 0 {
             return Err(Error::Protocol(format!(
                 "Smartmap size must be a non-zero {HUGE_PAGE_SIZE}-byte multiple"
             )));
         }
-        let mut stream = UnixStream::connect(&self.socket)?;
-        let req = protocol::Request::open(path.into(), size);
-        let (resp, mut fds) =
-            uds::send_json_recv_json_with_fds::<protocol::Response>(&mut stream, &req, &[])?;
-        if fds.len() != 1 {
+        let stream = UnixStream::connect(&self.socket)?;
+        let req = protocol::Frame::map(path.into(), size);
+        uds::send_json_with_fds(&stream, &req, &[])?;
+
+        let (mapped, mut fds) = uds::recv_json_with_fds::<protocol::Frame>(&stream)?;
+        if mapped.kind == protocol::TYPE_FATAL {
+            return Err(Error::Protocol(mapped.error));
+        }
+        if mapped.kind != protocol::TYPE_MAPPED {
             return Err(Error::Protocol(format!(
-                "open_memory_file returned {} fds, want 1",
+                "Smartmap expected mapped frame, got {}",
+                mapped.kind
+            )));
+        }
+        if mapped.fd != protocol::FD_MEMORY || fds.len() != 1 {
+            return Err(Error::Protocol(format!(
+                "mapped frame returned fd purpose {:?} with {} fds, want memory with 1 fd",
+                mapped.fd,
                 fds.len()
             )));
         }
-        let fd = fds.remove(0);
-        if !resp.ok {
-            return Err(Error::Protocol(resp.error.unwrap_or_else(|| {
-                "open_memory_file failed without error text".to_string()
-            })));
+        if mapped.page_size != HUGE_PAGE_SIZE as usize {
+            return Err(Error::Protocol(format!(
+                "mapped page_size got {}, want {}",
+                mapped.page_size, HUGE_PAGE_SIZE
+            )));
         }
-        let memory_id = resp
-            .memory_id
-            .ok_or_else(|| Error::Protocol("open_memory_file response missing memory_id".into()))?;
-        Ok(Memory {
-            client: self.clone(),
-            memory_id,
-            size,
-            extents: resp.extents,
-            memfd: unsafe { File::from_raw_fd(fd.into_raw_fd()) },
+        if mapped.size != size {
+            return Err(Error::Protocol(format!(
+                "mapped size got {}, want {}",
+                mapped.size, size
+            )));
+        }
+
+        let memfd = unsafe { File::from_raw_fd(fds.remove(0).into_raw_fd()) };
+        let mapping =
+            Mapping::map_private_extents(memfd.as_raw_fd(), mapped.size, &mapped.extents)?;
+        let uffd = UserfaultFd::new_registered(mapping.as_ptr() as usize, mapping.len())?;
+        let attach = protocol::Frame::attach(mapping.as_ptr() as usize, mapping.len());
+        uds::send_json_with_fds(&stream, &attach, &[uffd.as_raw_fd()])?;
+        let (attached, fds) = uds::recv_json_with_fds::<protocol::Frame>(&stream)?;
+        if !fds.is_empty() {
+            return Err(Error::Protocol(format!(
+                "attached frame returned {} unexpected fds",
+                fds.len()
+            )));
+        }
+        if attached.kind == protocol::TYPE_FATAL {
+            return Err(Error::Protocol(attached.error));
+        }
+        if attached.kind != protocol::TYPE_ATTACHED {
+            return Err(Error::Protocol(format!(
+                "Smartmap expected attached frame, got {}",
+                attached.kind
+            )));
+        }
+
+        Ok(SmartMapping {
+            stream,
+            memfd,
+            extents: mapped.extents,
+            mapping,
+            uffd,
         })
     }
 }
 
-pub struct Memory {
-    client: Client,
-    memory_id: String,
-    size: u64,
-    extents: Vec<Extent>,
-    memfd: File,
-}
-
-impl Memory {
-    pub fn memory_id(&self) -> &str {
-        &self.memory_id
+pub trait ControlHandler {
+    fn release(&mut self, _ranges: &[ControlRange]) -> io::Result<()> {
+        Ok(())
     }
 
-    pub fn extents(&self) -> &[Extent] {
-        &self.extents
+    fn probe(&mut self, _ranges: &[ControlRange]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_fault(&mut self, _ranges: &[ControlRange]) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct SmartMapping {
+    stream: UnixStream,
+    memfd: File,
+    extents: Vec<Extent>,
+    mapping: Mapping,
+    uffd: UserfaultFd,
+}
+
+impl SmartMapping {
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.mapping.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.mapping.len()
     }
 
     pub fn raw_fd(&self) -> i32 {
         self.memfd.as_raw_fd()
     }
 
-    pub fn map_private_contiguous(&self) -> Result<Mapping> {
-        Mapping::map_private_extents(self.memfd.as_raw_fd(), self.size, &self.extents)
+    pub fn extents(&self) -> &[Extent] {
+        &self.extents
     }
 
-    pub fn create_userfaultfd(&self, mapping: &Mapping) -> Result<UserfaultFd> {
-        UserfaultFd::new_registered(mapping.as_ptr() as usize, mapping.len())
-    }
-
-    pub unsafe fn attach_userfaultfd(&self, fd: OwnedFd) -> UserfaultFd {
-        UserfaultFd::from_owned_fd(fd)
-    }
-
-    pub fn serve_faults(&self, uffd: &UserfaultFd, mapping: &Mapping) -> Result<FaultSession> {
-        self.serve_faults_len(uffd, mapping, mapping.len())
-    }
-
-    pub fn serve_faults_len(
+    pub fn sync_dirty<P: AsRef<Path>, H: MutatorHooks>(
         &self,
-        uffd: &UserfaultFd,
-        mapping: &Mapping,
-        len: usize,
-    ) -> Result<FaultSession> {
-        let mut stream = UnixStream::connect(&self.client.socket)?;
-        let req =
-            protocol::Request::serve_faults(self.memory_id.clone(), mapping.as_ptr() as usize, len);
-        uds::send_json_with_fds(&mut stream, &req, &[uffd.as_raw_fd()])?;
-        Ok(FaultSession {
-            stream,
-            memory_id: self.memory_id.clone(),
-        })
+        writeback_path: P,
+        hooks: &mut H,
+    ) -> Result<()> {
+        self.mapping.sync_dirty(&self.uffd, writeback_path, hooks)
     }
 
-    pub fn close(self) -> Result<()> {
-        self.close_ref()
-    }
-
-    pub fn close_ref(&self) -> Result<()> {
-        let mut stream = UnixStream::connect(&self.client.socket)?;
-        let req = protocol::Request::close(self.memory_id.clone());
-        uds::send_json_with_fds(&mut stream, &req, &[])?;
-        let resp = protocol::read_response(stream)?;
-        if resp.ok {
-            Ok(())
-        } else {
-            Err(Error::Protocol(resp.error.unwrap_or_else(|| {
-                "close_memory_file failed without error text".to_string()
-            })))
-        }
-    }
-}
-
-pub trait ControlHandler {
-    fn evict(&mut self, ranges: &[ControlRange]) -> io::Result<()>;
-
-    fn probe(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
-        self.evict(ranges)
-    }
-
-    fn write_fault(&mut self, ranges: &[ControlRange]) -> io::Result<()> {
-        self.probe(ranges)
-    }
-}
-
-pub struct FaultSession {
-    stream: UnixStream,
-    memory_id: String,
-}
-
-impl FaultSession {
-    pub fn shutdown(&self) -> io::Result<()> {
-        self.stream.shutdown(Shutdown::Both)
-    }
-
-    pub fn handle_next_control<H: ControlHandler>(&mut self, handler: &mut H) -> Result<bool> {
-        let msg = match protocol::read_control_message(&mut self.stream) {
+    pub fn handle_next_control<H: ControlHandler>(&self, handler: &mut H) -> Result<bool> {
+        let (msg, fds) = match uds::recv_json_with_fds::<protocol::Frame>(&self.stream) {
             Ok(msg) => msg,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-            Err(e) => return Err(e.into()),
+            Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => return Err(e),
         };
+        if !fds.is_empty() {
+            return Err(Error::Protocol(format!(
+                "control frame returned {} unexpected fds",
+                fds.len()
+            )));
+        }
+        if msg.kind == protocol::TYPE_FATAL {
+            return Err(Error::Protocol(msg.error));
+        }
         if msg.kind.is_empty() {
             return Ok(false);
         }
+
+        let mut released = Vec::new();
         let result = match msg.kind.as_str() {
-            protocol::CONTROL_EVICT => handler.evict(&msg.ranges),
-            protocol::CONTROL_PROBE => handler.probe(&msg.ranges),
-            protocol::CONTROL_WRITE_FAULT => handler.write_fault(&msg.ranges),
+            protocol::TYPE_RELEASE => match self.mapping.release_clean_ranges(&msg.ranges) {
+                Ok(ranges) => {
+                    released = ranges;
+                    handler.release(&released)
+                }
+                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+            },
+            protocol::TYPE_PROBE => match self.mapping.release_clean_ranges(&msg.ranges) {
+                Ok(ranges) => {
+                    released = ranges;
+                    handler.probe(&released)
+                }
+                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
+            },
+            protocol::TYPE_WRITE_FAULT => handler.write_fault(&msg.ranges),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported Smartmap control message {other}"),
             )),
         };
-        protocol::write_control_ack(&mut self.stream, msg.ack(result.is_ok(), result.err()))?;
+        let (ok, err) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        let ack = protocol::Frame::ack(ok, err, released);
+        uds::send_json_with_fds(&self.stream, &ack, &[])?;
         Ok(true)
     }
 
-    pub fn run_control_loop<H: ControlHandler>(&mut self, handler: &mut H) -> Result<()> {
+    pub fn run_control_loop<H: ControlHandler>(&self, handler: &mut H) -> Result<()> {
         while self.handle_next_control(handler)? {}
         Ok(())
-    }
-
-    pub fn memory_id(&self) -> &str {
-        &self.memory_id
     }
 }

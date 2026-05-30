@@ -126,10 +126,8 @@ type fuseUFFDControlRange struct {
 }
 
 type fuseUFFDControlMessage struct {
-	Type      string                 `json:"type"`
-	RequestID uint64                 `json:"request_id"`
-	MemoryID  string                 `json:"memory_id,omitempty"`
-	Ranges    []fuseUFFDControlRange `json:"ranges,omitempty"`
+	Type   string                 `json:"type"`
+	Ranges []fuseUFFDControlRange `json:"ranges,omitempty"`
 }
 
 type fuseUFFDOpenedMemory struct {
@@ -817,7 +815,6 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 	defer client.Close()
 	state.client = client
 	state.mapped = client.Mapped()
-	state.uffdFD = client.UffdFD()
 	state.baseAddr = client.BaseAddr()
 	go client.ServeControls()
 	stopPeriodicFlush := state.startPeriodicFlush(time.Duration(script.FlushIntervalMillis) * time.Millisecond)
@@ -873,7 +870,7 @@ func fuseUFFDHugeTLBUnavailableReason(err error) string {
 	return ""
 }
 
-func (h *fuseRustSmartmapControlHandler) Evict(ranges []smartmap.RustControlRange) error {
+func (h *fuseRustSmartmapControlHandler) Release(ranges []smartmap.RustControlRange) error {
 	msg, err := h.controlMessage(ranges)
 	if err != nil {
 		return err
@@ -886,7 +883,7 @@ func (h *fuseRustSmartmapControlHandler) Evict(ranges []smartmap.RustControlRang
 }
 
 func (h *fuseRustSmartmapControlHandler) Probe(ranges []smartmap.RustControlRange) error {
-	_, err := h.flushRanges(ranges)
+	_, err := h.controlMessage(ranges)
 	return err
 }
 

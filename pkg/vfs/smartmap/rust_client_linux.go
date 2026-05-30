@@ -10,7 +10,7 @@ package smartmap
 #include <stdlib.h>
 #include "juicefs_smartmap.h"
 
-extern int goSmartmapEvict(void *userdata, jfs_smartmap_range *ranges, size_t len);
+extern int goSmartmapRelease(void *userdata, jfs_smartmap_range *ranges, size_t len);
 extern int goSmartmapProbe(void *userdata, jfs_smartmap_range *ranges, size_t len);
 extern int goSmartmapWriteFault(void *userdata, jfs_smartmap_range *ranges, size_t len);
 extern int goSmartmapPauseMutator(void *userdata);
@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
-	"strings"
 	"time"
 	"unsafe"
 )
@@ -35,7 +34,7 @@ type RustControlRange struct {
 }
 
 type RustControlHandler interface {
-	Evict([]RustControlRange) error
+	Release([]RustControlRange) error
 	Probe([]RustControlRange) error
 	WriteFault([]RustControlRange) error
 }
@@ -48,72 +47,20 @@ type RustSyncHandler interface {
 
 type RustClient struct {
 	client          *C.jfs_smartmap_client
-	memory          *C.jfs_smartmap_memory
 	mapping         *C.jfs_smartmap_mapping
-	uffd            *C.jfs_smartmap_uffd
-	session         *C.jfs_smartmap_session
 	handle          *cgo.Handle
 	mapped          []byte
-	memoryID        string
-	uffdFD          int
 	base            uintptr
 	controlsStarted bool
 	controlsDone    chan struct{}
 }
 
 func OpenRustClient(sock, path string, size, regionSize uint64, handler RustControlHandler) (*RustClient, error) {
-	rc, err := OpenRustMemory(sock, path, size)
-	if err != nil {
-		return nil, err
-	}
-	cleanupOnError := func() {
-		rc.Close()
-	}
-
-	var errC *C.char
-	if C.jfs_smartmap_map_private(rc.memory, &rc.mapping, &errC) != 0 {
-		msg := peekRustSmartmapError(errC)
-		cleanupOnError()
-		C.jfs_smartmap_string_free(errC)
-		return nil, errors.New(msg)
-	}
-	ptr := C.jfs_smartmap_mapping_ptr(rc.mapping)
-	length := int(C.jfs_smartmap_mapping_len(rc.mapping))
-	if ptr == nil || length <= 0 {
-		cleanupOnError()
-		return nil, errors.New("rust smartmap mapping returned empty range")
-	}
-	rc.mapped = unsafe.Slice((*byte)(ptr), length)
-	rc.base = uintptr(ptr)
-	if C.jfs_smartmap_create_uffd(rc.memory, rc.mapping, &rc.uffd, &errC) != 0 {
-		msg := peekRustSmartmapError(errC)
-		cleanupOnError()
-		C.jfs_smartmap_string_free(errC)
-		return nil, errors.New(msg)
-	}
-	if regionSize == 0 {
-		regionSize = uint64(length)
-	}
-	if regionSize > uint64(length) {
-		cleanupOnError()
-		return nil, fmt.Errorf("region_size %d exceeds mapping size %d", regionSize, length)
-	}
-	if C.jfs_smartmap_serve_faults_len(rc.memory, rc.uffd, rc.mapping, C.size_t(regionSize), &rc.session, &errC) != 0 {
-		cleanupOnError()
-		return nil, takeRustSmartmapError(errC)
-	}
-	rc.uffdFD = int(C.jfs_smartmap_uffd_raw_fd(rc.uffd))
-	if handler != nil {
-		handle := cgo.NewHandle(handler)
-		rc.handle = &handle
-		rc.controlsDone = make(chan struct{})
-	}
-	return rc, nil
-}
-
-func OpenRustMemory(sock, path string, size uint64) (*RustClient, error) {
 	if path == "" {
 		return nil, errors.New("rust smartmap client requires path")
+	}
+	if regionSize != 0 && regionSize != size {
+		return nil, fmt.Errorf("region_size %d is unsupported; smartmap maps the full %d-byte file", regionSize, size)
 	}
 	sockC := C.CString(sock)
 	defer C.free(unsafe.Pointer(sockC))
@@ -129,20 +76,25 @@ func OpenRustMemory(sock, path string, size uint64) (*RustClient, error) {
 	cleanupOnError := func() {
 		rc.Close()
 	}
-
-	if C.jfs_smartmap_open_memory(client, pathC, C.uint64_t(size), &rc.memory, &err) != 0 {
+	if C.jfs_smartmap_mapping_open(client, pathC, C.uint64_t(size), &rc.mapping, &err) != 0 {
 		msg := peekRustSmartmapError(err)
 		cleanupOnError()
 		C.jfs_smartmap_string_free(err)
 		return nil, errors.New(msg)
 	}
-	memoryIDC := C.jfs_smartmap_memory_id(rc.memory)
-	if memoryIDC == nil {
+	ptr := C.jfs_smartmap_mapping_ptr(rc.mapping)
+	length := int(C.jfs_smartmap_mapping_len(rc.mapping))
+	if ptr == nil || length <= 0 {
 		cleanupOnError()
-		return nil, errors.New("rust smartmap client returned empty memory id")
+		return nil, errors.New("rust smartmap mapping returned empty range")
 	}
-	rc.memoryID = C.GoString(memoryIDC)
-	C.jfs_smartmap_string_free((*C.char)(memoryIDC))
+	rc.mapped = unsafe.Slice((*byte)(ptr), length)
+	rc.base = uintptr(ptr)
+	if handler != nil {
+		handle := cgo.NewHandle(handler)
+		rc.handle = &handle
+		rc.controlsDone = make(chan struct{})
+	}
 	return rc, nil
 }
 
@@ -152,52 +104,21 @@ func (c *RustClient) Close() {
 		C.jfs_smartmap_mapping_free(c.mapping)
 		c.mapping = nil
 	}
-	if c.memory != nil {
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			err := c.CloseMemory()
-			if err == nil || !strings.Contains(err.Error(), "active") || time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
 	if c.client != nil {
 		C.jfs_smartmap_client_free(c.client)
 		c.client = nil
 	}
 }
 
-func (c *RustClient) CloseMemory() error {
-	if c.memory == nil {
-		return nil
-	}
-	var err *C.char
-	if C.jfs_smartmap_memory_close(c.memory, &err) != 0 {
-		return takeRustSmartmapError(err)
-	}
-	C.jfs_smartmap_memory_free(c.memory)
-	c.memory = nil
-	return nil
-}
-
 func (c *RustClient) CloseFaults() {
-	if c.session != nil && c.controlsStarted {
+	if c.mapping != nil && c.controlsStarted {
 		var err *C.char
-		_ = C.jfs_smartmap_session_shutdown(c.session, &err)
+		_ = C.jfs_smartmap_mapping_shutdown(c.mapping, &err)
 		C.jfs_smartmap_string_free(err)
 		select {
 		case <-c.controlsDone:
 		case <-time.After(5 * time.Second):
 		}
-	}
-	if c.session != nil {
-		C.jfs_smartmap_session_free(c.session)
-		c.session = nil
-	}
-	if c.uffd != nil {
-		C.jfs_smartmap_uffd_free(c.uffd)
-		c.uffd = nil
 	}
 	if c.handle != nil {
 		c.handle.Delete()
@@ -206,8 +127,8 @@ func (c *RustClient) CloseFaults() {
 }
 
 func (c *RustClient) Sync(writebackPath string, handler RustSyncHandler) error {
-	if c.mapping == nil || c.uffd == nil {
-		return errors.New("rust smartmap sync requires an active mapping and uffd")
+	if c.mapping == nil {
+		return errors.New("rust smartmap sync requires an active mapping")
 	}
 	if writebackPath == "" {
 		return errors.New("rust smartmap sync requires writeback path")
@@ -232,7 +153,7 @@ func (c *RustClient) Sync(writebackPath string, handler RustSyncHandler) error {
 		page_synced: (C.jfs_smartmap_page_synced_cb)(C.goSmartmapPageSynced),
 	}
 	var err *C.char
-	if C.jfs_smartmap_mapping_sync(c.mapping, c.uffd, pathC, &callbacks, &err) != 0 {
+	if C.jfs_smartmap_mapping_sync(c.mapping, pathC, &callbacks, &err) != 0 {
 		return takeRustSmartmapError(err)
 	}
 	return nil
@@ -246,14 +167,14 @@ func (c *RustClient) ServeControls() {
 	defer close(c.controlsDone)
 	callbacks := C.jfs_smartmap_callbacks{
 		userdata:    unsafe.Pointer(uintptr(*c.handle)),
-		evict:       (C.jfs_smartmap_control_cb)(C.goSmartmapEvict),
+		release:     (C.jfs_smartmap_control_cb)(C.goSmartmapRelease),
 		probe:       (C.jfs_smartmap_control_cb)(C.goSmartmapProbe),
 		write_fault: (C.jfs_smartmap_control_cb)(C.goSmartmapWriteFault),
 	}
 	for {
 		var handled C.int
 		var err *C.char
-		if C.jfs_smartmap_handle_next_control(c.session, &callbacks, &handled, &err) != 0 {
+		if C.jfs_smartmap_handle_next_control(c.mapping, &callbacks, &handled, &err) != 0 {
 			C.jfs_smartmap_string_free(err)
 			return
 		}
@@ -273,19 +194,11 @@ func (c *RustClient) Mapped() []byte {
 	return c.mapped
 }
 
-func (c *RustClient) MemoryID() string {
-	return c.memoryID
-}
-
 func (c *RustClient) SharedFD() int {
-	if c.memory == nil {
+	if c.mapping == nil {
 		return -1
 	}
-	return int(C.jfs_smartmap_memory_raw_fd(c.memory))
-}
-
-func (c *RustClient) UffdFD() int {
-	return c.uffdFD
+	return int(C.jfs_smartmap_mapping_raw_fd(c.mapping))
 }
 
 func (c *RustClient) BaseAddr() uintptr {
@@ -293,14 +206,14 @@ func (c *RustClient) BaseAddr() uintptr {
 }
 
 func (c *RustClient) Extents() []UFFDExtent {
-	if c.memory == nil {
+	if c.mapping == nil {
 		return nil
 	}
-	count := int(C.jfs_smartmap_memory_extent_count(c.memory))
+	count := int(C.jfs_smartmap_mapping_extent_count(c.mapping))
 	extents := make([]UFFDExtent, 0, count)
 	for i := 0; i < count; i++ {
 		var extent C.jfs_smartmap_extent
-		if C.jfs_smartmap_memory_extent_at(c.memory, C.size_t(i), &extent) != 0 {
+		if C.jfs_smartmap_mapping_extent_at(c.mapping, C.size_t(i), &extent) != 0 {
 			continue
 		}
 		extents = append(extents, UFFDExtent{
@@ -319,9 +232,9 @@ func peekRustSmartmapError(err *C.char) string {
 	return C.GoString(err)
 }
 
-//export goSmartmapEvict
-func goSmartmapEvict(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t) C.int {
-	return goSmartmapControl(userdata, ranges, length, "evict")
+//export goSmartmapRelease
+func goSmartmapRelease(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t) C.int {
+	return goSmartmapControl(userdata, ranges, length, "release")
 }
 
 //export goSmartmapProbe
@@ -336,7 +249,7 @@ func goSmartmapWriteFault(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range,
 
 func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, length C.size_t, kind string) C.int {
 	if userdata == nil {
-		return -1
+		return 0
 	}
 	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustControlHandler)
 	if !ok || handler == nil {
@@ -353,8 +266,8 @@ func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, le
 	}
 	var err error
 	switch kind {
-	case "evict":
-		err = handler.Evict(goRanges)
+	case "release":
+		err = handler.Release(goRanges)
 	case "probe":
 		err = handler.Probe(goRanges)
 	case "write_fault":

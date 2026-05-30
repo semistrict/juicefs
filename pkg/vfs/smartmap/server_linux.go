@@ -64,10 +64,6 @@ const (
 	uffdSocketPayloadSize = 64 << 10
 	uffdHugePageSize      = 2 << 20
 
-	uffdOpOpenMemoryFile   = "open_memory_file"
-	uffdOpCloseMemoryFile  = "close_memory_file"
-	uffdOpServeMemoryFault = "serve_memory_faults"
-
 	nrUserfaultfd = C.__NR_userfaultfd
 	uffdAPI       = C.UFFD_API
 
@@ -131,31 +127,16 @@ func newUFFDIORegister(start, length uintptr, mode uint64) uffdioRegister {
 }
 
 type UFFDRegion struct {
-	BaseHostVirtAddr uintptr `json:"base_host_virt_addr"`
-	Size             uintptr `json:"size"`
-	Offset           uint64  `json:"offset"`
-	PageSize         uintptr `json:"page_size"`
-}
-
-type UFFDRequest struct {
-	Op       string       `json:"op,omitempty"`
-	Path     string       `json:"path,omitempty"`
-	Size     uint64       `json:"size,omitempty"`
-	MemoryID string       `json:"memory_id,omitempty"`
-	Mappings []UFFDRegion `json:"mappings,omitempty"`
+	BaseHostVirtAddr uintptr
+	Size             uintptr
+	Offset           uint64
+	PageSize         uintptr
 }
 
 type UFFDExtent struct {
 	FileOffset uint64 `json:"file_offset"`
 	Length     uint64 `json:"length"`
 	ShmOffset  uint64 `json:"shm_offset"`
-}
-
-type uffdResponse struct {
-	OK       bool         `json:"ok"`
-	Error    string       `json:"error,omitempty"`
-	MemoryID string       `json:"memory_id,omitempty"`
-	Extents  []UFFDExtent `json:"extents,omitempty"`
 }
 
 func (r UFFDRegion) endHostVirtAddr() uintptr {
@@ -310,39 +291,54 @@ func validateOptions(options Options) (int, error) {
 
 func handleUFFDConn(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache) {
 	defer conn.Close()
-	req, fds, err := readUFFDRequest(conn)
+	frame, fds, err := readSmartmapFrame(conn)
 	if err != nil {
 		for _, fd := range fds {
 			_ = syscall.Close(fd)
 		}
-		writeUFFDResponse(conn, err)
+		writeSmartmapFatal(conn, err)
 		return
 	}
-	handleUFFDSharedOp(v, conn, done, cache, req, fds)
+	handleSmartmapSession(v, conn, done, cache, frame, fds)
 }
 
-func readUFFDRequest(conn *net.UnixConn) (UFFDRequest, []int, error) {
+func readSmartmapFrame(conn *net.UnixConn) (smartmapFrame, []int, error) {
 	payload := make([]byte, uffdSocketPayloadSize)
 	oob := make([]byte, syscall.CmsgSpace(uffdFdSize))
 	n, oobn, flags, _, err := conn.ReadMsgUnix(payload, oob)
 	if err != nil {
-		return UFFDRequest{}, nil, fmt.Errorf("read smartmap socket message: %w", err)
+		return smartmapFrame{}, nil, fmt.Errorf("read smartmap socket message: %w", err)
+	}
+	fds, err := parseSmartmapFrameFDs(oob[:oobn])
+	if err != nil {
+		return smartmapFrame{}, nil, err
 	}
 	if flags&unix.MSG_CTRUNC != 0 {
-		return UFFDRequest{}, nil, errors.New("smartmap socket control message truncated")
+		closeUFFDSharedFDs(fds)
+		return smartmapFrame{}, nil, errors.New("smartmap socket control message truncated")
 	}
 	if flags&unix.MSG_TRUNC != 0 {
-		return UFFDRequest{}, nil, errors.New("smartmap socket payload truncated")
+		closeUFFDSharedFDs(fds)
+		return smartmapFrame{}, nil, errors.New("smartmap socket payload truncated")
 	}
-	var req UFFDRequest
+	var frame smartmapFrame
 	dec := json.NewDecoder(bytes.NewReader(payload[:n]))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		return UFFDRequest{}, nil, fmt.Errorf("parse uffd request: %w", err)
+	if err := dec.Decode(&frame); err != nil {
+		closeUFFDSharedFDs(fds)
+		return smartmapFrame{}, nil, fmt.Errorf("parse smartmap frame: %w", err)
 	}
-	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err := validateSmartmapFrameFDs(frame, fds); err != nil {
+		closeUFFDSharedFDs(fds)
+		return smartmapFrame{}, nil, err
+	}
+	return frame, fds, nil
+}
+
+func parseSmartmapFrameFDs(oob []byte) ([]int, error) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
 	if err != nil {
-		return UFFDRequest{}, nil, fmt.Errorf("parse uffd control message: %w", err)
+		return nil, fmt.Errorf("parse smartmap control message: %w", err)
 	}
 	var fds []int
 	for i := range msgs {
@@ -351,29 +347,53 @@ func readUFFDRequest(conn *net.UnixConn) (UFFDRequest, []int, error) {
 			for _, fd := range fds {
 				_ = syscall.Close(fd)
 			}
-			return UFFDRequest{}, nil, fmt.Errorf("parse uffd unix rights: %w", err)
+			return nil, fmt.Errorf("parse smartmap unix rights: %w", err)
 		}
 		fds = append(fds, rights...)
 	}
-	return req, fds, nil
+	return fds, nil
 }
 
-func writeUFFDResponse(conn *net.UnixConn, err error) {
-	resp := uffdResponse{OK: err == nil}
-	if err != nil {
-		resp.Error = err.Error()
+func validateSmartmapFrameFDs(frame smartmapFrame, fds []int) error {
+	switch frame.FD {
+	case "":
+		if len(fds) != 0 {
+			return fmt.Errorf("smartmap frame %s expected no fds, got %d", frame.Type, len(fds))
+		}
+	case smartmapFDMemory, smartmapFDUFFD:
+		if len(fds) != 1 {
+			return fmt.Errorf("smartmap frame %s expected exactly one %s fd, got %d", frame.Type, frame.FD, len(fds))
+		}
+	default:
+		return fmt.Errorf("smartmap frame %s has unsupported fd purpose %q", frame.Type, frame.FD)
 	}
-	_ = json.NewEncoder(conn).Encode(resp)
+	return nil
 }
 
-func writeUFFDResponseWithFD(conn *net.UnixConn, resp uffdResponse, fd int) error {
-	payload, err := json.Marshal(resp)
+func writeSmartmapFrame(conn *net.UnixConn, frame smartmapFrame) error {
+	payload, err := json.Marshal(frame)
 	if err != nil {
-		writeUFFDResponse(conn, err)
+		return err
+	}
+	_, _, err = conn.WriteMsgUnix(payload, nil, nil)
+	return err
+}
+
+func writeSmartmapFrameWithFD(conn *net.UnixConn, frame smartmapFrame, fd int) error {
+	frame.FD = smartmapFDMemory
+	payload, err := json.Marshal(frame)
+	if err != nil {
 		return err
 	}
 	_, _, err = conn.WriteMsgUnix(payload, syscall.UnixRights(fd), nil)
 	return err
+}
+
+func writeSmartmapFatal(conn *net.UnixConn, err error) {
+	if err == nil {
+		return
+	}
+	_ = writeSmartmapFrame(conn, smartmapFrame{Type: smartmapFrameFatal, Error: err.Error()})
 }
 
 func peerMetaContext(conn *net.UnixConn) meta.Context {
@@ -522,22 +542,4 @@ func drainFd(fd int) {
 			return
 		}
 	}
-}
-
-func socketClosed(fd int) (bool, error) {
-	var buf [256]byte
-	n, _, _, _, err := unix.Recvmsg(fd, buf[:], nil, unix.MSG_PEEK|unix.MSG_DONTWAIT)
-	if err == nil {
-		if n == 0 {
-			return true, nil
-		}
-		return false, fmt.Errorf("unexpected data on uffd request socket: %q", string(buf[:n]))
-	}
-	if err == unix.ECONNRESET || err == unix.ENOTCONN {
-		return true, nil
-	}
-	if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-		return false, nil
-	}
-	return false, fmt.Errorf("peek uffd request socket: %w", err)
 }

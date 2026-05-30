@@ -1,6 +1,6 @@
 use std::io;
 use std::mem;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use serde::{de::DeserializeOwned, Serialize};
@@ -10,23 +10,13 @@ use crate::Result;
 const PAYLOAD_SIZE: usize = 64 * 1024;
 
 pub fn send_json_with_fds<T: Serialize>(
-    stream: &mut UnixStream,
+    stream: &UnixStream,
     value: &T,
     fds: &[RawFd],
 ) -> Result<()> {
     let payload = serde_json::to_vec(value)?;
     sendmsg(stream, &payload, fds)?;
     Ok(())
-}
-
-pub fn send_json_recv_json_with_fds<T: DeserializeOwned>(
-    stream: &mut UnixStream,
-    value: &impl Serialize,
-    fds: &[RawFd],
-) -> Result<(T, Vec<OwnedFd>)> {
-    let payload = serde_json::to_vec(value)?;
-    sendmsg(stream, &payload, fds)?;
-    recv_fds::<T>(stream)
 }
 
 fn sendmsg(stream: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -61,7 +51,7 @@ fn sendmsg(stream: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()>
     Ok(())
 }
 
-fn recv_fds<T: DeserializeOwned>(stream: &UnixStream) -> Result<(T, Vec<OwnedFd>)> {
+pub fn recv_json_with_fds<T: DeserializeOwned>(stream: &UnixStream) -> Result<(T, Vec<OwnedFd>)> {
     let mut payload = vec![0u8; PAYLOAD_SIZE];
     let mut control = vec![0u8; cmsg_space(mem::size_of::<RawFd>() * 8)];
     let mut iov = libc::iovec {
@@ -76,6 +66,9 @@ fn recv_fds<T: DeserializeOwned>(stream: &UnixStream) -> Result<(T, Vec<OwnedFd>
     let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error().into());
+    }
+    if n == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Smartmap socket closed").into());
     }
     if msg.msg_flags & libc::MSG_CTRUNC != 0 || msg.msg_flags & libc::MSG_TRUNC != 0 {
         return Err(
@@ -109,5 +102,3 @@ fn cmsg_space(len: usize) -> usize {
 fn cmsg_len(len: usize) -> usize {
     unsafe { libc::CMSG_LEN(len as u32) as usize }
 }
-
-use std::os::fd::AsRawFd;

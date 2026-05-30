@@ -52,10 +52,6 @@ pub struct UserfaultFd {
 }
 
 impl UserfaultFd {
-    pub unsafe fn from_owned_fd(fd: OwnedFd) -> Self {
-        Self { fd }
-    }
-
     pub fn new_registered(base: usize, len: usize) -> Result<Self> {
         if len == 0 || len as u64 % HUGE_PAGE_SIZE != 0 {
             return Err(io::Error::new(

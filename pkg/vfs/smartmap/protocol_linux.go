@@ -19,17 +19,21 @@
 
 package smartmap
 
-// Control messages are exchanged as JSON on the serve_memory_faults UDS
-// connection after the initial SCM_RIGHTS handoff.
 const (
 	uffdEvictionPolicyProbe = "probe"
 
-	uffdControlEvict         = "evict"
-	uffdControlEvictAck      = "evict_ack"
-	uffdControlProbe         = "probe"
-	uffdControlProbeAck      = "probe_ack"
-	uffdControlWriteFault    = "write_fault"
-	uffdControlWriteFaultAck = "write_fault_ack"
+	smartmapFrameMap        = "map"
+	smartmapFrameMapped     = "mapped"
+	smartmapFrameAttach     = "attach"
+	smartmapFrameAttached   = "attached"
+	smartmapFrameFatal      = "fatal"
+	smartmapFrameAck        = "ack"
+	smartmapFrameRelease    = "release"
+	smartmapFrameProbe      = "probe"
+	smartmapFrameWriteFault = "write_fault"
+
+	smartmapFDMemory = "memory"
+	smartmapFDUFFD   = "uffd"
 )
 
 type uffdControlRange struct {
@@ -38,16 +42,16 @@ type uffdControlRange struct {
 	ShmOffset  uint64 `json:"shm_offset"`
 }
 
-type uffdControlMessage struct {
-	Type      string             `json:"type"`
-	RequestID uint64             `json:"request_id"`
-	MemoryID  string             `json:"memory_id,omitempty"`
-	Ranges    []uffdControlRange `json:"ranges,omitempty"`
-}
-
-type uffdControlAck struct {
-	Type      string `json:"type"`
-	RequestID uint64 `json:"request_id"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
+type smartmapFrame struct {
+	Type             string             `json:"type"`
+	Path             string             `json:"path,omitempty"`
+	Size             uint64             `json:"size,omitempty"`
+	PageSize         uintptr            `json:"page_size,omitempty"`
+	FD               string             `json:"fd,omitempty"`
+	Extents          []UFFDExtent       `json:"extents,omitempty"`
+	BaseHostVirtAddr uintptr            `json:"base_host_virt_addr,omitempty"`
+	Ranges           []uffdControlRange `json:"ranges,omitempty"`
+	Released         []uffdControlRange `json:"released,omitempty"`
+	OK               *bool              `json:"ok,omitempty"`
+	Error            string             `json:"error,omitempty"`
 }

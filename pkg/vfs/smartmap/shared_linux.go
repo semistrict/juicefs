@@ -20,7 +20,6 @@
 package smartmap
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -103,11 +102,9 @@ type uffdSharedSession struct {
 	v       *vfs.VFS
 	ctx     vfs.LogContext
 	cache   *uffdSharedCache
-	req     UFFDRequest
 	memory  *uffdMemory
+	mapping []UFFDRegion
 	conn    *net.UnixConn
-	dec     *json.Decoder
-	enc     *json.Encoder
 	ctrlMu  sync.Mutex
 	uffdFd  int
 	connFd  int
@@ -153,87 +150,102 @@ func closeUFFDSharedFDs(fds []int) {
 	}
 }
 
-func handleUFFDSharedOp(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache, req UFFDRequest, fds []int) {
+func handleSmartmapSession(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache, frame smartmapFrame, fds []int) {
 	if cache == nil {
 		closeUFFDSharedFDs(fds)
-		writeUFFDResponse(conn, errors.New("uffd shared memory cache is unavailable"))
+		writeSmartmapFatal(conn, errors.New("smartmap shared memory cache is unavailable"))
 		return
 	}
 	ctx := vfs.NewLogContext(peerMetaContext(conn))
-	switch req.Op {
-	case uffdOpOpenMemoryFile:
-		if len(fds) != 0 {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, fmt.Errorf("open_memory_file expected no fds, got %d", len(fds)))
-			return
-		}
-		memory, err := cache.openMemoryFile(v, ctx, req.Path, req.Size)
-		if err != nil {
-			writeUFFDResponse(conn, err)
-			return
-		}
-		clientFD, err := cache.openReadOnlyFD()
-		if err != nil {
-			_ = cache.closeMemory(memory.id)
-			writeUFFDResponse(conn, err)
-			return
-		}
-		defer unix.Close(clientFD)
-		resp := uffdResponse{OK: true, MemoryID: memory.id, Extents: memory.extents}
-		if err := writeUFFDResponseWithFD(conn, resp, clientFD); err != nil {
-			_ = cache.closeMemory(memory.id)
-			logger.Warnf("write open_memory_file response for %s: %s", req.Path, err)
-		}
-	case uffdOpCloseMemoryFile:
-		if len(fds) != 0 {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, fmt.Errorf("close_memory_file expected no fds, got %d", len(fds)))
-			return
-		}
-		writeUFFDResponse(conn, cache.closeMemory(req.MemoryID))
-	case uffdOpServeMemoryFault:
-		if len(fds) != 1 {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, fmt.Errorf("serve_memory_faults expected exactly one uffd fd, got %d", len(fds)))
-			return
-		}
-		if err := validateUFFDSharedMappings(req.Mappings); err != nil {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, err)
-			return
-		}
-		memory, err := cache.memory(req.MemoryID)
-		if err != nil {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, err)
-			return
-		}
-		connFd, err := unixConnFD(conn)
-		if err != nil {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, err)
-			return
-		}
-		uffdFD := fds[0]
-		s := &uffdSharedSession{
-			v: v, ctx: ctx, cache: cache, req: req, memory: memory,
-			conn: conn, dec: json.NewDecoder(conn), enc: json.NewEncoder(conn),
-			uffdFd: uffdFD, connFd: connFd, done: done,
-		}
-		if err := cache.beginMemorySession(memory, s); err != nil {
-			closeUFFDSharedFDs(fds)
-			writeUFFDResponse(conn, err)
-			return
-		}
-		err = s.serve()
-		cache.endMemorySession(memory, s)
-		if err != nil {
-			logger.Warnf("shared uffd session for %s ended with error: %s", memory.path, err)
-		}
-		writeUFFDResponse(conn, err)
-	default:
+	if frame.Type != smartmapFrameMap {
 		closeUFFDSharedFDs(fds)
-		writeUFFDResponse(conn, fmt.Errorf("unsupported uffd op: %s", req.Op))
+		writeSmartmapFatal(conn, fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameMap, frame.Type))
+		return
+	}
+	if len(fds) != 0 {
+		closeUFFDSharedFDs(fds)
+		writeSmartmapFatal(conn, fmt.Errorf("smartmap map expected no fds, got %d", len(fds)))
+		return
+	}
+	memory, err := cache.openMappedFile(v, ctx, frame.Path, frame.Size)
+	if err != nil {
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	defer func() {
+		if err := cache.closeMemory(memory.id); err != nil {
+			logger.Warnf("close smartmap memory %s: %s", memory.path, err)
+		}
+	}()
+	clientFD, err := cache.openReadOnlyFD()
+	if err != nil {
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	mapped := smartmapFrame{Type: smartmapFrameMapped, Size: memory.size, PageSize: uffdHugePageSize, Extents: memory.extents}
+	err = writeSmartmapFrameWithFD(conn, mapped, clientFD)
+	_ = unix.Close(clientFD)
+	if err != nil {
+		logger.Warnf("write smartmap mapped response for %s: %s", frame.Path, err)
+		return
+	}
+
+	attach, attachFDs, err := readSmartmapFrame(conn)
+	if err != nil {
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	if attach.Type != smartmapFrameAttach {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameAttach, attach.Type))
+		return
+	}
+	if len(attachFDs) != 1 || attach.FD != smartmapFDUFFD {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, fmt.Errorf("smartmap attach expected exactly one uffd fd, got purpose %q count %d", attach.FD, len(attachFDs)))
+		return
+	}
+	mapping := []UFFDRegion{{
+		BaseHostVirtAddr: attach.BaseHostVirtAddr,
+		Size:             uintptr(attach.Size),
+		Offset:           0,
+		PageSize:         attach.PageSize,
+	}}
+	if attach.Size != memory.size {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, fmt.Errorf("smartmap attach size %d does not match mapped size %d", attach.Size, memory.size))
+		return
+	}
+	if err := validateUFFDSharedMappings(mapping); err != nil {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	connFd, err := unixConnFD(conn)
+	if err != nil {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	s := &uffdSharedSession{
+		v: v, ctx: ctx, cache: cache, memory: memory, mapping: mapping,
+		conn: conn, uffdFd: attachFDs[0], connFd: connFd, done: done,
+	}
+	if err := cache.beginMemorySession(memory, s); err != nil {
+		closeUFFDSharedFDs(attachFDs)
+		writeSmartmapFatal(conn, err)
+		return
+	}
+	if err := writeSmartmapFrame(conn, smartmapFrame{Type: smartmapFrameAttached}); err != nil {
+		cache.endMemorySession(memory, s)
+		closeUFFDSharedFDs(attachFDs)
+		return
+	}
+	err = s.serve()
+	cache.endMemorySession(memory, s)
+	if err != nil {
+		logger.Warnf("smartmap session for %s ended with error: %s", memory.path, err)
+		writeSmartmapFatal(conn, err)
 	}
 }
 
@@ -258,16 +270,16 @@ func validateUFFDSharedMappings(mappings []UFFDRegion) error {
 	return nil
 }
 
-func (c *uffdSharedCache) openMemoryFile(v *vfs.VFS, ctx vfs.LogContext, reqPath string, size uint64) (*uffdMemory, error) {
+func (c *uffdSharedCache) openMappedFile(v *vfs.VFS, ctx vfs.LogContext, reqPath string, size uint64) (*uffdMemory, error) {
 	if reqPath == "" {
-		return nil, errors.New("open_memory_file path is empty")
+		return nil, errors.New("smartmap map path is empty")
 	}
 	if size == 0 || size%uffdHugePageSize != 0 {
-		return nil, fmt.Errorf("open_memory_file size must be a non-zero %d-byte multiple", uffdHugePageSize)
+		return nil, fmt.Errorf("smartmap map size must be a non-zero %d-byte multiple", uffdHugePageSize)
 	}
 	p := path.Clean(reqPath)
 	if !path.IsAbs(p) {
-		return nil, fmt.Errorf("open_memory_file path must be absolute: %s", reqPath)
+		return nil, fmt.Errorf("smartmap map path must be absolute: %s", reqPath)
 	}
 	var ino vfs.Ino
 	attr := &vfs.Attr{}
@@ -275,10 +287,10 @@ func (c *uffdSharedCache) openMemoryFile(v *vfs.VFS, ctx vfs.LogContext, reqPath
 		return nil, fmt.Errorf("resolve %s: %w", p, st)
 	}
 	if attr.Typ != meta.TypeFile {
-		return nil, fmt.Errorf("open_memory_file path is not a file: %s", p)
+		return nil, fmt.Errorf("smartmap map path is not a file: %s", p)
 	}
 	if attr.Length < size {
-		return nil, fmt.Errorf("open_memory_file size %d exceeds file length %d", size, attr.Length)
+		return nil, fmt.Errorf("smartmap map size %d exceeds file length %d", size, attr.Length)
 	}
 	entry, fh, st := v.Open(ctx, ino, syscall.O_RDONLY)
 	if st != 0 {
@@ -379,27 +391,11 @@ func (c *uffdSharedCache) openReadOnlyFD() (int, error) {
 	return roFD, nil
 }
 
-func (c *uffdSharedCache) memory(id string) (*uffdMemory, error) {
-	if id == "" {
-		return nil, errors.New("memory_id is empty")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	memory := c.memories[id]
-	if memory == nil {
-		return nil, fmt.Errorf("unknown memory_id: %s", id)
-	}
-	if memory.closing {
-		return nil, fmt.Errorf("memory_id %s is closing", id)
-	}
-	return memory, nil
-}
-
 func (c *uffdSharedCache) beginMemorySession(memory *uffdMemory, session *uffdSharedSession) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if memory.closing || c.memories[memory.id] != memory {
-		return fmt.Errorf("memory_id %s is closing", memory.id)
+		return fmt.Errorf("smartmap memory %s is closing", memory.id)
 	}
 	memory.sessions++
 	memory.active[session] = struct{}{}
@@ -419,19 +415,19 @@ func (c *uffdSharedCache) endMemorySession(memory *uffdMemory, session *uffdShar
 
 func (c *uffdSharedCache) closeMemory(id string) error {
 	if id == "" {
-		return errors.New("memory_id is empty")
+		return errors.New("smartmap memory handle is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	memory := c.memories[id]
 	if memory == nil {
-		return fmt.Errorf("unknown memory_id: %s", id)
+		return fmt.Errorf("unknown smartmap memory handle: %s", id)
 	}
 	if memory.closing {
-		return fmt.Errorf("memory_id %s is closing", id)
+		return fmt.Errorf("smartmap memory %s is closing", id)
 	}
 	if memory.sessions > 0 {
-		return fmt.Errorf("memory_id %s has %d active uffd sessions", id, memory.sessions)
+		return fmt.Errorf("smartmap memory %s has %d active uffd sessions", id, memory.sessions)
 	}
 	memory.closing = true
 	for _, page := range memory.pages {
@@ -615,20 +611,11 @@ func (s *uffdSharedSession) poll() error {
 		if hasPollEvent(pollFds[2].Revents, unix.POLLIN) {
 			drainFd(s.wakeR)
 		}
-		if hasPollEvent(pollFds[3].Revents, unix.POLLERR|unix.POLLNVAL) {
-			return fmt.Errorf("shared uffd request socket poll error: revents=%#x", pollFds[3].Revents)
-		}
 		if hasPollEvent(pollFds[3].Revents, unix.POLLHUP) {
 			return nil
 		}
-		if hasPollEvent(pollFds[3].Revents, unix.POLLIN) {
-			closed, err := socketClosed(s.connFd)
-			if err != nil {
-				return err
-			}
-			if closed {
-				return nil
-			}
+		if hasPollEvent(pollFds[3].Revents, unix.POLLERR|unix.POLLNVAL) {
+			return fmt.Errorf("shared uffd request socket poll error: revents=%#x", pollFds[3].Revents)
 		}
 		if hasPollEvent(pollFds[0].Revents, unix.POLLHUP) {
 			return nil
@@ -658,7 +645,7 @@ func (s *uffdSharedSession) poll() error {
 
 func (s *uffdSharedSession) handleFault(pf *uffdPagefault) error {
 	addr := uintptr(pf.address)
-	region, err := findUFFDRegion(s.req.Mappings, addr)
+	region, err := findUFFDRegion(s.mapping, addr)
 	if err != nil {
 		return err
 	}
@@ -712,6 +699,13 @@ func (s *uffdSharedSession) continueCleanReadFault(pageAddr uintptr, pf *uffdPag
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = uffdWriteProtect(s.uffdFd, pageAddr, uintptr(uffdHugePageSize), true); err != nil {
+		_ = uffdWake(s.uffdFd, pageAddr, uintptr(uffdHugePageSize))
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EEXIST) || errors.Is(err, unix.ESRCH) {
+			return nil
+		}
 		return err
 	}
 	return uffdWake(s.uffdFd, pageAddr, uintptr(uffdHugePageSize))
@@ -971,16 +965,17 @@ func (s *uffdSharedSession) maybeStartProbeRound(skip *uffdSharedPage) error {
 		return nil
 	}
 	for _, target := range targets {
-		if err := target.session.requestProbe(target.ranges); err != nil {
+		released, err := target.session.requestProbe(target.ranges)
+		if err != nil {
 			s.cache.cancelProbeRound(seq, pages)
 			if isUFFDControlClosedErr(err) {
 				return nil
 			}
 			return err
 		}
-		if err := target.session.refreshMemoryRanges(target.ranges); err != nil {
+		if !controlRangesCover(target.ranges, released) {
 			s.cache.cancelProbeRound(seq, pages)
-			return err
+			return nil
 		}
 	}
 	s.cache.finishProbeRoundAfter(seq, pages, cfg.monitor)
@@ -1127,16 +1122,17 @@ func (c *uffdSharedCache) finishProbeRound(seq uint64, pages []*uffdSharedPage) 
 
 func (s *uffdSharedSession) evictReservedPage(page *uffdSharedPage, targets []uffdEvictionTarget) error {
 	for _, target := range targets {
-		if err := target.session.requestEviction(target.ranges); err != nil {
+		released, err := target.session.requestRelease(target.ranges)
+		if err != nil {
 			if isUFFDControlClosedErr(err) {
 				continue
 			}
 			s.cache.cancelEviction(page, err)
 			return err
 		}
-		if err := target.session.refreshMemoryRanges(target.ranges); err != nil {
-			s.cache.cancelEviction(page, err)
-			return err
+		if !controlRangesCover(target.ranges, released) {
+			s.cache.cancelEviction(page, nil)
+			return nil
 		}
 	}
 	s.cache.mu.Lock()
@@ -1159,6 +1155,22 @@ func (s *uffdSharedSession) evictReservedPage(page *uffdSharedPage, targets []uf
 	s.cache.clearProbeLocked(page)
 	s.cache.finishEvictionLocked(page, nil)
 	return nil
+}
+
+func controlRangesCover(want, got []uffdControlRange) bool {
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g.FileOffset == w.FileOffset && g.Length == w.Length {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *uffdSharedCache) cancelEviction(page *uffdSharedPage, err error) {
@@ -1210,51 +1222,44 @@ func (c *uffdSharedCache) clearProbeLocked(page *uffdSharedPage) {
 	page.probeCold = false
 }
 
-func (s *uffdSharedSession) requestEviction(ranges []uffdControlRange) error {
-	_, err := s.requestControl(uffdControlEvict, uffdControlEvictAck, ranges)
-	return err
+func (s *uffdSharedSession) requestRelease(ranges []uffdControlRange) ([]uffdControlRange, error) {
+	ack, err := s.requestControl(smartmapFrameRelease, ranges)
+	return ack.Released, err
 }
 
-func (s *uffdSharedSession) requestProbe(ranges []uffdControlRange) error {
-	_, err := s.requestControl(uffdControlProbe, uffdControlProbeAck, ranges)
-	return err
+func (s *uffdSharedSession) requestProbe(ranges []uffdControlRange) ([]uffdControlRange, error) {
+	ack, err := s.requestControl(smartmapFrameProbe, ranges)
+	return ack.Released, err
 }
 
 func (s *uffdSharedSession) requestWriteFault(ranges []uffdControlRange) error {
-	_, err := s.requestControl(uffdControlWriteFault, uffdControlWriteFaultAck, ranges)
+	_, err := s.requestControl(smartmapFrameWriteFault, ranges)
 	return err
 }
 
-func (s *uffdSharedSession) requestControl(messageType, ackType string, ranges []uffdControlRange) (uffdControlAck, error) {
+func (s *uffdSharedSession) requestControl(messageType string, ranges []uffdControlRange) (smartmapFrame, error) {
 	s.ctrlMu.Lock()
 	defer s.ctrlMu.Unlock()
 
-	s.cache.mu.Lock()
-	s.cache.control++
-	requestID := s.cache.control
-	s.cache.mu.Unlock()
-
-	msg := uffdControlMessage{
-		Type:      messageType,
-		RequestID: requestID,
-		MemoryID:  s.memory.id,
-		Ranges:    ranges,
+	if err := writeSmartmapFrame(s.conn, smartmapFrame{Type: messageType, Ranges: ranges}); err != nil {
+		return smartmapFrame{}, fmt.Errorf("send smartmap %s request: %w", messageType, err)
 	}
-	if err := s.enc.Encode(msg); err != nil {
-		return uffdControlAck{}, fmt.Errorf("send uffd %s request: %w", messageType, err)
+	ack, fds, err := readSmartmapFrame(s.conn)
+	if err != nil {
+		return smartmapFrame{}, fmt.Errorf("read smartmap %s ack: %w", messageType, err)
 	}
-	var ack uffdControlAck
-	if err := s.dec.Decode(&ack); err != nil {
-		return uffdControlAck{}, fmt.Errorf("read uffd %s ack: %w", messageType, err)
+	if len(fds) != 0 {
+		closeUFFDSharedFDs(fds)
+		return smartmapFrame{}, fmt.Errorf("unexpected smartmap %s ack fds: %d", messageType, len(fds))
 	}
-	if ack.Type != ackType || ack.RequestID != requestID {
-		return uffdControlAck{}, fmt.Errorf("unexpected uffd %s ack: type=%s request_id=%d", messageType, ack.Type, ack.RequestID)
+	if ack.Type != smartmapFrameAck {
+		return smartmapFrame{}, fmt.Errorf("unexpected smartmap %s ack type=%s", messageType, ack.Type)
 	}
-	if !ack.OK {
+	if ack.OK == nil || !*ack.OK {
 		if ack.Error == "" {
-			ack.Error = fmt.Sprintf("client rejected uffd %s", messageType)
+			ack.Error = fmt.Sprintf("client rejected smartmap %s", messageType)
 		}
-		return uffdControlAck{}, errors.New(ack.Error)
+		return smartmapFrame{}, errors.New(ack.Error)
 	}
 	return ack, nil
 }
