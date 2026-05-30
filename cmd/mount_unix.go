@@ -53,6 +53,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/juicedata/juicefs/pkg/vfs/uffd"
 )
 
 var mountPid int
@@ -494,6 +495,10 @@ func mountFlags() []cli.Flag {
 		selfFlags = append(selfFlags, &cli.BoolFlag{
 			Name:  "disable-transparent-hugepage",
 			Usage: "disable transparent huge page to avoid latency spikes caused by kernel's memory compaction",
+		})
+		selfFlags = append(selfFlags, &cli.StringFlag{
+			Name:  "uffd-socket",
+			Usage: "Unix socket path for serving userfaultfd missing-page faults",
 		})
 	}
 	return append(selfFlags, fuseFlags()...)
@@ -1136,6 +1141,9 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Warnf("On kernel versions below 5.11 (current: %d.%d), negative-entry-cache may cause concurrent check-then-create operations (e.g. mkdir -p) to fail in a distributed environment", major, minor)
 	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
+	if runtime.GOOS == "linux" {
+		conf.UFFDSocket = c.String("uffd-socket")
+	}
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
 	if allSquash != "" || rootSquash != "" {
@@ -1153,6 +1161,13 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		}
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
+	if conf.UFFDSocket != "" {
+		stopUFFD, err := uffd.Start(v, conf.UFFDSocket)
+		if err != nil {
+			logger.Fatalf("uffd socket: %s", err)
+		}
+		defer stopUFFD()
+	}
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
 	if err != nil {
 		logger.Fatalf("fuse: %s", err)
