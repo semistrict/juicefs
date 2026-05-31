@@ -291,21 +291,26 @@ func validateOptions(options Options) (int, error) {
 
 func handleUFFDConn(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache) {
 	defer conn.Close()
-	frame, fds, err := readSmartmapFrame(conn)
+	sock := smartmapConn{conn: conn}
+	frame, fds, err := sock.readFrame()
 	if err != nil {
 		for _, fd := range fds {
 			_ = syscall.Close(fd)
 		}
-		writeSmartmapFatal(conn, err)
+		sock.writeFatal(err)
 		return
 	}
-	handleSmartmapSession(v, conn, done, cache, frame, fds)
+	handleSmartmapSession(v, sock, done, cache, frame, fds)
 }
 
-func readSmartmapFrame(conn *net.UnixConn) (smartmapFrame, []int, error) {
+type smartmapConn struct {
+	conn *net.UnixConn
+}
+
+func (c smartmapConn) readFrame() (smartmapFrame, []int, error) {
 	payload := make([]byte, uffdSocketPayloadSize)
 	oob := make([]byte, syscall.CmsgSpace(uffdFdSize))
-	n, oobn, flags, _, err := conn.ReadMsgUnix(payload, oob)
+	n, oobn, flags, _, err := c.conn.ReadMsgUnix(payload, oob)
 	if err != nil {
 		return smartmapFrame{}, nil, fmt.Errorf("read smartmap socket message: %w", err)
 	}
@@ -370,30 +375,41 @@ func validateSmartmapFrameFDs(frame smartmapFrame, fds []int) error {
 	return nil
 }
 
-func writeSmartmapFrame(conn *net.UnixConn, frame smartmapFrame) error {
+func (c smartmapConn) writeFrame(frame smartmapFrame) error {
+	if frame.FD != "" {
+		return fmt.Errorf("smartmap frame %s must use writeFrameWithFD for fd purpose %q", frame.Type, frame.FD)
+	}
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return err
 	}
-	_, _, err = conn.WriteMsgUnix(payload, nil, nil)
+	_, _, err = c.conn.WriteMsgUnix(payload, nil, nil)
 	return err
 }
 
-func writeSmartmapFrameWithFD(conn *net.UnixConn, frame smartmapFrame, fd int) error {
-	frame.FD = smartmapFDMemory
+func (c smartmapConn) writeFrameWithFD(frame smartmapFrame, purpose string, fd int) error {
+	switch purpose {
+	case smartmapFDMemory, smartmapFDUFFD:
+	default:
+		return fmt.Errorf("unsupported smartmap fd purpose %q", purpose)
+	}
+	if fd < 0 {
+		return fmt.Errorf("invalid smartmap %s fd: %d", purpose, fd)
+	}
+	frame.FD = purpose
 	payload, err := json.Marshal(frame)
 	if err != nil {
 		return err
 	}
-	_, _, err = conn.WriteMsgUnix(payload, syscall.UnixRights(fd), nil)
+	_, _, err = c.conn.WriteMsgUnix(payload, syscall.UnixRights(fd), nil)
 	return err
 }
 
-func writeSmartmapFatal(conn *net.UnixConn, err error) {
+func (c smartmapConn) writeFatal(err error) {
 	if err == nil {
 		return
 	}
-	_ = writeSmartmapFrame(conn, smartmapFrame{Type: smartmapFrameFatal, Error: err.Error()})
+	_ = c.writeFrame(smartmapFrame{Type: smartmapFrameFatal, Error: err.Error()})
 }
 
 func peerMetaContext(conn *net.UnixConn) meta.Context {

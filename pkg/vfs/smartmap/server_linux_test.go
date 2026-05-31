@@ -43,6 +43,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/juicedata/juicefs/pkg/vfs/smartmap/rustclient"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -195,7 +196,7 @@ func TestSmartmapFrameRejectsFDMismatch(t *testing.T) {
 	_, _, err = client.WriteMsgUnix(payload, syscall.UnixRights(int(devNull.Fd()), int(devNull.Fd())), nil)
 	require.NoError(t, err)
 
-	_, fds, err := readSmartmapFrame(server)
+	_, fds, err := smartmapConn{conn: server}.readFrame()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "expected exactly one uffd fd")
 	require.Empty(t, fds)
@@ -214,7 +215,7 @@ func TestReadSmartmapFrameRejectsMalformedPayload(t *testing.T) {
 	_, _, err = client.WriteMsgUnix([]byte("{"), syscall.UnixRights(int(devNull.Fd())), nil)
 	require.NoError(t, err)
 
-	_, fds, err := readSmartmapFrame(server)
+	_, fds, err := smartmapConn{conn: server}.readFrame()
 	require.Error(t, err)
 	require.Empty(t, fds)
 	require.Equal(t, openFDs, countOpenFDs(t))
@@ -228,7 +229,7 @@ func TestReadSmartmapFrameRejectsUnknownField(t *testing.T) {
 	_, err := client.Write([]byte(`{"type":"map","path":"/file","size":2097152,"memory_id":"memory-1"}`))
 	require.NoError(t, err)
 
-	_, fds, err := readSmartmapFrame(server)
+	_, fds, err := smartmapConn{conn: server}.readFrame()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown field")
 	require.Empty(t, fds)
@@ -259,7 +260,7 @@ func TestReadSmartmapFrameRejectsTruncatedControlMessage(t *testing.T) {
 	t.Cleanup(func() { uffdFdSize = oldFdSize })
 	uffdFdSize = 0
 
-	_, fds, err := readSmartmapFrame(server)
+	_, fds, err := smartmapConn{conn: server}.readFrame()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "control message truncated")
 	require.Empty(t, fds)
@@ -319,8 +320,8 @@ func TestUFFDSharedEvictionCancelKeepsPopulatedPageUsable(t *testing.T) {
 
 func TestUFFDSharedBeginSessionRejectsClosingMemory(t *testing.T) {
 	cache := newUFFDSharedCache()
-	memory := &uffdMemory{id: "memory-1", closing: true, active: make(map[*uffdSharedSession]struct{})}
-	cache.memories[memory.id] = memory
+	memory := &uffdMemory{path: "/memory", closing: true, active: make(map[*uffdSharedSession]struct{})}
+	cache.memories[memory] = struct{}{}
 
 	err := cache.beginMemorySession(memory, &uffdSharedSession{})
 	require.ErrorContains(t, err, "closing")
@@ -329,30 +330,119 @@ func TestUFFDSharedBeginSessionRejectsClosingMemory(t *testing.T) {
 
 func TestUFFDSharedEvictionPrefersLessMappedPage(t *testing.T) {
 	cache := newUFFDSharedCache()
-	shared := &uffdSharedPage{key: "shared", populated: true, lastUsed: 1}
-	private := &uffdSharedPage{key: "private", populated: true, lastUsed: 2}
+	shared := &uffdSharedPage{key: "shared", refs: 1, populated: true, lastUsed: 1}
+	private := &uffdSharedPage{key: "private", refs: 1, populated: true, lastUsed: 2}
 	cache.pages[shared.key] = shared
 	cache.pages[private.key] = private
 	cache.resident = 2
 
 	sessionA := &uffdSharedSession{}
 	sessionB := &uffdSharedSession{}
-	cache.memories["shared-a"] = &uffdMemory{
+	sharedA := &uffdMemory{
 		pages:  map[uint64]*uffdSharedPage{0: shared},
 		active: map[*uffdSharedSession]struct{}{sessionA: {}, sessionB: {}},
 	}
-	cache.memories["shared-b"] = &uffdMemory{
+	sharedB := &uffdMemory{
 		pages:  map[uint64]*uffdSharedPage{0: shared},
 		active: map[*uffdSharedSession]struct{}{sessionA: {}},
 	}
-	cache.memories["private"] = &uffdMemory{
+	privateMemory := &uffdMemory{
 		pages:  map[uint64]*uffdSharedPage{0: private},
 		active: map[*uffdSharedSession]struct{}{sessionA: {}},
 	}
+	cache.memories[sharedA] = struct{}{}
+	cache.memories[sharedB] = struct{}{}
+	cache.memories[privateMemory] = struct{}{}
 
-	victim, targets := cache.reserveEvictionVictim(nil, 2)
+	victim, targets := cache.reserveEvictionVictim(nil, nil, 2)
 	require.Same(t, private, victim)
 	require.Len(t, targets, 1)
+}
+
+func TestUFFDSharedBackgroundReclaimWatermarks(t *testing.T) {
+	cache := newUFFDSharedCache(uffdSharedCacheOptions{maxResidentPages: 10})
+
+	cache.mu.Lock()
+	cache.resident = 7
+	require.False(t, cache.shouldStartBackgroundReclaimLocked())
+	cache.resident = 8
+	require.True(t, cache.shouldStartBackgroundReclaimLocked())
+	require.Equal(t, 8, cache.backgroundReclaimHighPagesLocked())
+	require.Equal(t, 7, cache.backgroundReclaimTargetPagesLocked())
+	cache.mu.Unlock()
+}
+
+func TestUFFDSharedBackgroundReclaimBatchesSequentialSameScorePages(t *testing.T) {
+	cache, pages := newTestUFFDBackgroundReclaimCache(10)
+
+	batch, targets := cache.reserveBackgroundReclaimBatch(nil)
+	require.Equal(t, pages[:3], batch)
+	require.Len(t, targets, 1)
+	require.Equal(t, []uffdControlRange{
+		{FileOffset: 0, Length: uffdHugePageSize, ShmOffset: 0},
+		{FileOffset: uffdHugePageSize, Length: uffdHugePageSize, ShmOffset: uffdHugePageSize},
+		{FileOffset: 2 * uffdHugePageSize, Length: uffdHugePageSize, ShmOffset: 2 * uffdHugePageSize},
+	}, targets[0].ranges)
+}
+
+func TestUFFDSharedBackgroundReclaimRunsToLowWatermark(t *testing.T) {
+	cache, pages := newTestUFFDBackgroundReclaimCache(10)
+	for memory := range cache.memories {
+		memory.active = nil
+	}
+
+	cache.maybeStartBackgroundReclaim(nil)
+	cache.reclaimWG.Wait()
+
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	require.False(t, cache.reclaiming)
+	require.Equal(t, 7, cache.resident)
+	require.False(t, pages[0].populated)
+	require.False(t, pages[1].populated)
+	require.False(t, pages[2].populated)
+}
+
+func TestUFFDSharedBackgroundReclaimDoesNotBatchDifferentScores(t *testing.T) {
+	cache, pages := newTestUFFDBackgroundReclaimCache(10)
+	extraSession := &uffdSharedSession{}
+	extraMemory := &uffdMemory{
+		pages:  map[uint64]*uffdSharedPage{0: pages[0]},
+		active: map[*uffdSharedSession]struct{}{extraSession: {}},
+	}
+	cache.memories[extraMemory] = struct{}{}
+
+	batch, targets := cache.reserveBackgroundReclaimBatch(nil)
+	require.Equal(t, pages[1:4], batch)
+	require.Len(t, targets, 1)
+	require.Equal(t, uint64(uffdHugePageSize), targets[0].ranges[0].FileOffset)
+}
+
+func newTestUFFDBackgroundReclaimCache(pagesCount int) (*uffdSharedCache, []*uffdSharedPage) {
+	cache := newUFFDSharedCache(uffdSharedCacheOptions{maxResidentPages: pagesCount})
+	session := &uffdSharedSession{}
+	memory := &uffdMemory{
+		pages:  make(map[uint64]*uffdSharedPage, pagesCount),
+		active: map[*uffdSharedSession]struct{}{session: {}},
+	}
+	pages := make([]*uffdSharedPage, 0, pagesCount)
+	for i := 0; i < pagesCount; i++ {
+		off := uint64(i) * uffdHugePageSize
+		page := &uffdSharedPage{
+			key:       fmt.Sprintf("page-%d", i),
+			shmOff:    off,
+			refs:      1,
+			populated: true,
+			lastUsed:  uint64(i + 1),
+		}
+		page.cond = sync.NewCond(&cache.mu)
+		cache.pages[page.key] = page
+		memory.pages[off] = page
+		pages = append(pages, page)
+	}
+	cache.memories[memory] = struct{}{}
+	cache.resident = pagesCount
+	return cache, pages
 }
 
 func TestUFFDSharedHugeTLBMemoryIntegration(t *testing.T) {
@@ -425,36 +515,11 @@ func TestSmartmapSessionRejectsAttachBeforeMap(t *testing.T) {
 	_, _, err = conn.WriteMsgUnix(payload, nil, nil)
 	require.NoError(t, err)
 
-	resp, fds, err := readSmartmapFrame(conn)
+	resp, fds, err := smartmapConn{conn: conn}.readFrame()
 	require.NoError(t, err)
 	require.Empty(t, fds)
 	require.Equal(t, smartmapFrameFatal, resp.Type)
 	require.Contains(t, resp.Error, "expected \"map\"")
-}
-
-func TestUFFDSharedRefreshUsesOpenedInodeAfterRename(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping hugetlb refresh identity test in short mode")
-	}
-
-	v, _ := createTestVFS(nil, "")
-	ctx := vfs.NewLogContext(meta.Background())
-	const memorySize = uffdHugePageSize
-	writePatternVFSFile(t, v, ctx, "base-memory", memorySize, 0x52)
-
-	cache := newUFFDSharedCache()
-	defer cache.close()
-	memory, err := cache.openMappedFile(v, ctx, "/base-memory", memorySize)
-	skipUnavailableHugeTLB(t, err)
-	require.NoError(t, err)
-
-	require.Equal(t, syscall.Errno(0), v.Rename(ctx, meta.RootInode, "base-memory", meta.RootInode, "renamed-memory", 0))
-	session := &uffdSharedSession{v: v, ctx: ctx, cache: cache, memory: memory}
-	require.NoError(t, session.refreshMemoryRanges([]uffdControlRange{{
-		FileOffset: 0,
-		Length:     uffdHugePageSize,
-		ShmOffset:  memory.extents[0].ShmOffset,
-	}}))
 }
 
 func TestUFFDSharedExtentsDedupeAcrossMultipleClones(t *testing.T) {
@@ -809,7 +874,7 @@ func TestUFFDSharedSocketCloseReleasesActiveSession(t *testing.T) {
 	require.NoError(t, err)
 	defer stop()
 
-	activeClient, activeErr := OpenRustClient(sock, "/base-memory", memorySize, 0, nil)
+	activeClient, activeErr := rustclient.Open(sock, "/base-memory", memorySize, 0, nil)
 	skipUnavailableHugeTLB(t, activeErr)
 	require.NoError(t, activeErr)
 	require.Equal(t, patternedUFFDByte(0x33, 0), readMappedByte(t, activeClient.Mapped(), 0))
@@ -1013,7 +1078,7 @@ func BenchmarkUFFDSharedFirstFault2MiB(b *testing.B) {
 			}
 			defer stop()
 
-			client, err := OpenRustClient(sock, "/base-memory", memorySize, 0, nil)
+			client, err := rustclient.Open(sock, "/base-memory", memorySize, 0, nil)
 			skipUnavailableHugeTLB(b, err)
 			if err != nil {
 				b.Fatal(err)
@@ -1204,7 +1269,7 @@ func runSharedUFFDClientScript(script uffdClientScript) uffdClientResult {
 		evictions: make(chan smartmapFrame, 16),
 		probes:    make(chan smartmapFrame, 16),
 	}
-	client, err := OpenRustClient(script.Sock, script.Path, script.Size, 0, handler)
+	client, err := rustclient.Open(script.Sock, script.Path, script.Size, 0, handler)
 	if err != nil {
 		if skip := hugeTLBUnavailableReason(err); skip != "" {
 			return uffdClientResult{Skip: skip}
@@ -1231,7 +1296,7 @@ type testRustSmartmapControlHandler struct {
 	probes    chan smartmapFrame
 }
 
-func (h *testRustSmartmapControlHandler) Release(ranges []RustControlRange) error {
+func (h *testRustSmartmapControlHandler) Release(ranges []rustclient.ControlRange) error {
 	msg := h.controlMessage(smartmapFrameRelease, ranges)
 	select {
 	case h.evictions <- msg:
@@ -1240,7 +1305,7 @@ func (h *testRustSmartmapControlHandler) Release(ranges []RustControlRange) erro
 	return nil
 }
 
-func (h *testRustSmartmapControlHandler) Probe(ranges []RustControlRange) error {
+func (h *testRustSmartmapControlHandler) Probe(ranges []rustclient.ControlRange) error {
 	msg := h.controlMessage(smartmapFrameProbe, ranges)
 	select {
 	case h.probes <- msg:
@@ -1249,11 +1314,11 @@ func (h *testRustSmartmapControlHandler) Probe(ranges []RustControlRange) error 
 	return nil
 }
 
-func (h *testRustSmartmapControlHandler) WriteFault(ranges []RustControlRange) error {
+func (h *testRustSmartmapControlHandler) WriteFault(ranges []rustclient.ControlRange) error {
 	return nil
 }
 
-func (h *testRustSmartmapControlHandler) controlMessage(kind string, ranges []RustControlRange) smartmapFrame {
+func (h *testRustSmartmapControlHandler) controlMessage(kind string, ranges []rustclient.ControlRange) smartmapFrame {
 	msg := smartmapFrame{Type: kind}
 	for _, r := range ranges {
 		msg.Ranges = append(msg.Ranges, uffdControlRange{FileOffset: r.FileOffset, Length: r.Length, ShmOffset: r.ShmOffset})
@@ -1448,7 +1513,7 @@ func uffdClientTimeout(script uffdClientScript) time.Duration {
 }
 
 type sharedMemoryOpen struct {
-	client  *RustClient
+	client  *rustclient.Client
 	fd      int
 	extents []UFFDExtent
 	path    string
@@ -1473,7 +1538,7 @@ func shmOffsetForFileOffset(t testing.TB, extents []UFFDExtent, off uint64) uint
 
 func openSharedMemoryFile(t testing.TB, sock, filePath string, size uint64) (sharedMemoryOpen, error) {
 	t.Helper()
-	client, err := OpenRustClient(sock, filePath, size, 0, noopRustControlHandler{})
+	client, err := rustclient.Open(sock, filePath, size, 0, noopRustControlHandler{})
 	if err != nil {
 		return sharedMemoryOpen{}, err
 	}
@@ -1481,16 +1546,28 @@ func openSharedMemoryFile(t testing.TB, sock, filePath string, size uint64) (sha
 	return sharedMemoryOpen{
 		client:  client,
 		fd:      client.SharedFD(),
-		extents: client.Extents(),
+		extents: rustClientExtents(client.Extents()),
 		path:    filePath,
 	}, nil
 }
 
+func rustClientExtents(extents []rustclient.Extent) []UFFDExtent {
+	out := make([]UFFDExtent, 0, len(extents))
+	for _, extent := range extents {
+		out = append(out, UFFDExtent{
+			FileOffset: extent.FileOffset,
+			Length:     extent.Length,
+			ShmOffset:  extent.ShmOffset,
+		})
+	}
+	return out
+}
+
 type noopRustControlHandler struct{}
 
-func (noopRustControlHandler) Release([]RustControlRange) error { return nil }
-func (noopRustControlHandler) Probe([]RustControlRange) error   { return nil }
-func (noopRustControlHandler) WriteFault([]RustControlRange) error {
+func (noopRustControlHandler) Release([]rustclient.ControlRange) error { return nil }
+func (noopRustControlHandler) Probe([]rustclient.ControlRange) error   { return nil }
+func (noopRustControlHandler) WriteFault([]rustclient.ControlRange) error {
 	return nil
 }
 

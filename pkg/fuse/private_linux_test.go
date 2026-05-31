@@ -45,6 +45,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/juicedata/juicefs/pkg/vfs/smartmap"
+	"github.com/juicedata/juicefs/pkg/vfs/smartmap/rustclient"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -131,8 +132,8 @@ type fuseUFFDControlMessage struct {
 }
 
 type fuseUFFDOpenedMemory struct {
-	client  *smartmap.RustClient
-	extents []smartmap.UFFDExtent
+	client  *rustclient.Client
+	extents []rustclient.Extent
 }
 
 type fuseUFFDClientState struct {
@@ -141,7 +142,7 @@ type fuseUFFDClientState struct {
 	baseAddr  uintptr
 	writeback string
 	alternate string
-	client    *smartmap.RustClient
+	client    *rustclient.Client
 	evictions chan fuseUFFDControlMessage
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -805,7 +806,7 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 		evictions: make(chan fuseUFFDControlMessage, 8),
 	}
 	handler := &fuseRustSmartmapControlHandler{state: state}
-	client, err := smartmap.OpenRustClient(script.Sock, script.Path, script.Size, 0, handler)
+	client, err := rustclient.Open(script.Sock, script.Path, script.Size, 0, handler)
 	if err != nil {
 		if skip := fuseUFFDHugeTLBUnavailableReason(err); skip != "" {
 			return fuseUFFDClientResult{Skip: skip}
@@ -830,7 +831,7 @@ func runFuseUFFDClientScript(script fuseUFFDClientScript) (result fuseUFFDClient
 
 func openFuseUFFDMemoryForTest(t testing.TB, sock, path string, size uint64) fuseUFFDOpenedMemory {
 	t.Helper()
-	client, err := smartmap.OpenRustClient(sock, path, size, 0, nil)
+	client, err := rustclient.Open(sock, path, size, 0, nil)
 	if skip := fuseUFFDHugeTLBUnavailableReason(err); skip != "" {
 		t.Skip(skip)
 	}
@@ -843,7 +844,7 @@ func closeFuseUFFDMemoryForTest(t testing.TB, _ string, opened fuseUFFDOpenedMem
 	opened.client.Close()
 }
 
-func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []smartmap.UFFDExtent, off uint64) uint64 {
+func fuseUFFDShmOffsetForFileOffset(t testing.TB, extents []rustclient.Extent, off uint64) uint64 {
 	t.Helper()
 	for _, extent := range extents {
 		if off >= extent.FileOffset && off < extent.FileOffset+extent.Length {
@@ -870,7 +871,7 @@ func fuseUFFDHugeTLBUnavailableReason(err error) string {
 	return ""
 }
 
-func (h *fuseRustSmartmapControlHandler) Release(ranges []smartmap.RustControlRange) error {
+func (h *fuseRustSmartmapControlHandler) Release(ranges []rustclient.ControlRange) error {
 	msg, err := h.controlMessage(ranges)
 	if err != nil {
 		return err
@@ -882,12 +883,12 @@ func (h *fuseRustSmartmapControlHandler) Release(ranges []smartmap.RustControlRa
 	return nil
 }
 
-func (h *fuseRustSmartmapControlHandler) Probe(ranges []smartmap.RustControlRange) error {
+func (h *fuseRustSmartmapControlHandler) Probe(ranges []rustclient.ControlRange) error {
 	_, err := h.controlMessage(ranges)
 	return err
 }
 
-func (h *fuseRustSmartmapControlHandler) WriteFault(ranges []smartmap.RustControlRange) error {
+func (h *fuseRustSmartmapControlHandler) WriteFault(ranges []rustclient.ControlRange) error {
 	h.state.mu.Lock()
 	defer h.state.mu.Unlock()
 	for h.state.syncing {
@@ -906,7 +907,7 @@ func (h *fuseRustSmartmapControlHandler) WriteFault(ranges []smartmap.RustContro
 	return nil
 }
 
-func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []rustclient.ControlRange) (fuseUFFDControlMessage, error) {
 	msg := fuseUFFDControlMessage{Ranges: make([]fuseUFFDControlRange, 0, len(ranges))}
 	for _, r := range ranges {
 		if r.Length != fuseUFFDHugePageSize {
@@ -921,11 +922,11 @@ func (h *fuseRustSmartmapControlHandler) controlMessage(ranges []smartmap.RustCo
 	return msg, nil
 }
 
-func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []smartmap.RustControlRange) (fuseUFFDControlMessage, error) {
+func (h *fuseRustSmartmapControlHandler) flushRanges(ranges []rustclient.ControlRange) (fuseUFFDControlMessage, error) {
 	return h.flushRangesWithDrop(ranges, true)
 }
 
-func (h *fuseRustSmartmapControlHandler) flushRangesWithDrop(ranges []smartmap.RustControlRange, drop bool) (fuseUFFDControlMessage, error) {
+func (h *fuseRustSmartmapControlHandler) flushRangesWithDrop(ranges []rustclient.ControlRange, drop bool) (fuseUFFDControlMessage, error) {
 	msg, err := h.controlMessage(ranges)
 	if err != nil {
 		return msg, err

@@ -2,7 +2,10 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::FileExt;
 use std::ptr;
-use std::{fs::OpenOptions, path::Path};
+use std::{
+    fs::{File, OpenOptions},
+    path::Path,
+};
 
 use crate::protocol::{ControlRange, Extent};
 use crate::uffd::UserfaultFd;
@@ -15,6 +18,8 @@ const PAGEMAP_UFFD_WP: u64 = 1 << 57;
 pub struct Mapping {
     ptr: *mut u8,
     len: usize,
+    pagemap: File,
+    page_size: u64,
 }
 
 impl Mapping {
@@ -58,9 +63,29 @@ impl Mapping {
                 return Err(err.into());
             }
         }
+        let pagemap = match OpenOptions::new().read(true).open("/proc/self/pagemap") {
+            Ok(pagemap) => pagemap,
+            Err(err) => {
+                unsafe {
+                    libc::munmap(reserve, len);
+                }
+                return Err(err.into());
+            }
+        };
+        let page_size = match host_page_size() {
+            Ok(page_size) => page_size,
+            Err(err) => {
+                unsafe {
+                    libc::munmap(reserve, len);
+                }
+                return Err(err.into());
+            }
+        };
         Ok(Self {
             ptr: reserve as *mut u8,
             len,
+            pagemap,
+            page_size,
         })
     }
 
@@ -77,36 +102,10 @@ impl Mapping {
     }
 
     pub fn release_clean_ranges(&self, ranges: &[ControlRange]) -> Result<Vec<ControlRange>> {
-        let pagemap = OpenOptions::new().read(true).open("/proc/self/pagemap")?;
-        let page_size = host_page_size()?;
         let mut released = Vec::new();
         for range in ranges {
-            if range.file_offset % HUGE_PAGE_SIZE != 0 || range.length != HUGE_PAGE_SIZE {
-                return Err(Error::Protocol(format!(
-                    "control range [{}, {}) is not one 2 MiB page",
-                    range.file_offset,
-                    range.file_offset + range.length
-                )));
-            }
-            let off = usize::try_from(range.file_offset)
-                .map_err(|_| Error::Protocol("control range offset too large".into()))?;
-            let len = usize::try_from(range.length)
-                .map_err(|_| Error::Protocol("control range length too large".into()))?;
-            let Some(end) = off.checked_add(len) else {
-                return Err(Error::Protocol(format!(
-                    "control range [{}, {}) overflows mapping length {}",
-                    off,
-                    off.saturating_add(len),
-                    self.len
-                )));
-            };
-            if end > self.len {
-                return Err(Error::Protocol(format!(
-                    "control range [{}, {}) exceeds mapping length {}",
-                    off, end, self.len
-                )));
-            }
-            if !private_page_releasable(&pagemap, self.ptr as usize + off, page_size)? {
+            let (off, len) = self.control_range(range)?;
+            if !self.page_state(off)?.releasable() {
                 continue;
             }
             let rc = unsafe {
@@ -151,17 +150,54 @@ impl Mapping {
     }
 
     fn dirty_pages(&self) -> Result<Vec<usize>> {
-        let pagemap = OpenOptions::new().read(true).open("/proc/self/pagemap")?;
-        let page_size = host_page_size()?;
-        let base = self.ptr as usize;
         let mut dirty = Vec::new();
         for off in (0..self.len).step_by(HUGE_PAGE_SIZE as usize) {
-            if !private_page_dirty(&pagemap, base + off, page_size)? {
+            if !self.page_state(off)?.dirty() {
                 continue;
             }
             dirty.push(off);
         }
         Ok(dirty)
+    }
+
+    fn control_range(&self, range: &ControlRange) -> Result<(usize, usize)> {
+        if range.file_offset % HUGE_PAGE_SIZE != 0 || range.length != HUGE_PAGE_SIZE {
+            return Err(Error::Protocol(format!(
+                "control range [{}, {}) is not one 2 MiB page",
+                range.file_offset,
+                range.file_offset + range.length
+            )));
+        }
+        let off = usize::try_from(range.file_offset)
+            .map_err(|_| Error::Protocol("control range offset too large".into()))?;
+        let len = usize::try_from(range.length)
+            .map_err(|_| Error::Protocol("control range length too large".into()))?;
+        let Some(end) = off.checked_add(len) else {
+            return Err(Error::Protocol(format!(
+                "control range [{}, {}) overflows mapping length {}",
+                off,
+                off.saturating_add(len),
+                self.len
+            )));
+        };
+        if end > self.len {
+            return Err(Error::Protocol(format!(
+                "control range [{}, {}) exceeds mapping length {}",
+                off, end, self.len
+            )));
+        }
+        Ok((off, len))
+    }
+
+    fn page_state(&self, off: usize) -> Result<PageState> {
+        let entry = pagemap_entry(&self.pagemap, self.ptr as usize + off, self.page_size)?;
+        if entry & PAGEMAP_PRESENT == 0 {
+            return Ok(PageState::Absent);
+        }
+        if entry & PAGEMAP_UFFD_WP != 0 {
+            return Ok(PageState::WriteProtected);
+        }
+        Ok(PageState::Dirty)
     }
 
     fn flush_pages<P: AsRef<Path>, H: MutatorHooks>(
@@ -187,6 +223,22 @@ impl Mapping {
         }
         file.sync_all()?;
         Ok(())
+    }
+}
+
+enum PageState {
+    Absent,
+    WriteProtected,
+    Dirty,
+}
+
+impl PageState {
+    fn dirty(&self) -> bool {
+        matches!(self, Self::Dirty)
+    }
+
+    fn releasable(&self) -> bool {
+        matches!(self, Self::Absent | Self::WriteProtected)
     }
 }
 
@@ -223,26 +275,6 @@ fn pagemap_entry(pagemap: &std::fs::File, addr: usize, page_size: u64) -> io::Re
     let mut buf = [0u8; PAGEMAP_ENTRY_SIZE as usize];
     pagemap.read_exact_at(&mut buf, vpn * PAGEMAP_ENTRY_SIZE)?;
     Ok(u64::from_le_bytes(buf))
-}
-
-fn private_page_dirty(pagemap: &std::fs::File, addr: usize, page_size: u64) -> io::Result<bool> {
-    let entry = pagemap_entry(pagemap, addr, page_size)?;
-    if entry & PAGEMAP_PRESENT == 0 {
-        return Ok(false);
-    }
-    Ok(entry & PAGEMAP_UFFD_WP == 0)
-}
-
-fn private_page_releasable(
-    pagemap: &std::fs::File,
-    addr: usize,
-    page_size: u64,
-) -> io::Result<bool> {
-    let entry = pagemap_entry(pagemap, addr, page_size)?;
-    if entry & PAGEMAP_PRESENT == 0 {
-        return Ok(true);
-    }
-    Ok(entry & PAGEMAP_UFFD_WP != 0)
 }
 
 impl Drop for Mapping {

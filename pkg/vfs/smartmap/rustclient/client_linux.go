@@ -1,11 +1,27 @@
 //go:build linux && cgo
 // +build linux,cgo
 
-package smartmap
+/*
+ * JuiceFS, Copyright 2026 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package rustclient
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../sdk/rust/smartmap/include
-#cgo LDFLAGS: ${SRCDIR}/../../../sdk/rust/smartmap/target/debug/libjuicefs_smartmap.a -ldl -lpthread -lm
+#cgo CFLAGS: -I${SRCDIR}/../../../../sdk/rust/smartmap/include
+#cgo LDFLAGS: ${SRCDIR}/../../../../sdk/rust/smartmap/target/debug/libjuicefs_smartmap.a -ldl -lpthread -lm
 #include <stdint.h>
 #include <stdlib.h>
 #include "juicefs_smartmap.h"
@@ -27,25 +43,31 @@ import (
 	"unsafe"
 )
 
-type RustControlRange struct {
+type ControlRange struct {
 	FileOffset uint64
 	Length     uint64
 	ShmOffset  uint64
 }
 
-type RustControlHandler interface {
-	Release([]RustControlRange) error
-	Probe([]RustControlRange) error
-	WriteFault([]RustControlRange) error
+type Extent struct {
+	FileOffset uint64
+	Length     uint64
+	ShmOffset  uint64
 }
 
-type RustSyncHandler interface {
+type ControlHandler interface {
+	Release([]ControlRange) error
+	Probe([]ControlRange) error
+	WriteFault([]ControlRange) error
+}
+
+type SyncHandler interface {
 	PauseMutator() error
 	ResumeMutator() error
 	PageSynced(offset uint64) error
 }
 
-type RustClient struct {
+type Client struct {
 	client          *C.jfs_smartmap_client
 	mapping         *C.jfs_smartmap_mapping
 	handle          *cgo.Handle
@@ -55,7 +77,7 @@ type RustClient struct {
 	controlsDone    chan struct{}
 }
 
-func OpenRustClient(sock, path string, size, regionSize uint64, handler RustControlHandler) (*RustClient, error) {
+func Open(sock, path string, size, regionSize uint64, handler ControlHandler) (*Client, error) {
 	if path == "" {
 		return nil, errors.New("rust smartmap client requires path")
 	}
@@ -72,7 +94,7 @@ func OpenRustClient(sock, path string, size, regionSize uint64, handler RustCont
 	if C.jfs_smartmap_client_new(sockC, &client, &err) != 0 {
 		return nil, takeRustSmartmapError(err)
 	}
-	rc := &RustClient{client: client}
+	rc := &Client{client: client}
 	cleanupOnError := func() {
 		rc.Close()
 	}
@@ -98,7 +120,7 @@ func OpenRustClient(sock, path string, size, regionSize uint64, handler RustCont
 	return rc, nil
 }
 
-func (c *RustClient) Close() {
+func (c *Client) Close() {
 	c.CloseFaults()
 	if c.mapping != nil {
 		C.jfs_smartmap_mapping_free(c.mapping)
@@ -110,7 +132,7 @@ func (c *RustClient) Close() {
 	}
 }
 
-func (c *RustClient) CloseFaults() {
+func (c *Client) CloseFaults() {
 	if c.mapping != nil && c.controlsStarted {
 		var err *C.char
 		_ = C.jfs_smartmap_mapping_shutdown(c.mapping, &err)
@@ -126,7 +148,7 @@ func (c *RustClient) CloseFaults() {
 	}
 }
 
-func (c *RustClient) Sync(writebackPath string, handler RustSyncHandler) error {
+func (c *Client) Sync(writebackPath string, handler SyncHandler) error {
 	if c.mapping == nil {
 		return errors.New("rust smartmap sync requires an active mapping")
 	}
@@ -159,7 +181,7 @@ func (c *RustClient) Sync(writebackPath string, handler RustSyncHandler) error {
 	return nil
 }
 
-func (c *RustClient) ServeControls() {
+func (c *Client) ServeControls() {
 	if c.handle == nil {
 		return
 	}
@@ -190,33 +212,33 @@ func takeRustSmartmapError(err *C.char) error {
 	return errors.New(msg)
 }
 
-func (c *RustClient) Mapped() []byte {
+func (c *Client) Mapped() []byte {
 	return c.mapped
 }
 
-func (c *RustClient) SharedFD() int {
+func (c *Client) SharedFD() int {
 	if c.mapping == nil {
 		return -1
 	}
 	return int(C.jfs_smartmap_mapping_raw_fd(c.mapping))
 }
 
-func (c *RustClient) BaseAddr() uintptr {
+func (c *Client) BaseAddr() uintptr {
 	return c.base
 }
 
-func (c *RustClient) Extents() []UFFDExtent {
+func (c *Client) Extents() []Extent {
 	if c.mapping == nil {
 		return nil
 	}
 	count := int(C.jfs_smartmap_mapping_extent_count(c.mapping))
-	extents := make([]UFFDExtent, 0, count)
+	extents := make([]Extent, 0, count)
 	for i := 0; i < count; i++ {
 		var extent C.jfs_smartmap_extent
 		if C.jfs_smartmap_mapping_extent_at(c.mapping, C.size_t(i), &extent) != 0 {
 			continue
 		}
-		extents = append(extents, UFFDExtent{
+		extents = append(extents, Extent{
 			FileOffset: uint64(extent.file_offset),
 			Length:     uint64(extent.length),
 			ShmOffset:  uint64(extent.shm_offset),
@@ -251,14 +273,14 @@ func goSmartmapControl(userdata unsafe.Pointer, ranges *C.jfs_smartmap_range, le
 	if userdata == nil {
 		return 0
 	}
-	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustControlHandler)
+	handler, ok := cgo.Handle(uintptr(userdata)).Value().(ControlHandler)
 	if !ok || handler == nil {
 		return -1
 	}
 	cRanges := unsafe.Slice(ranges, int(length))
-	goRanges := make([]RustControlRange, 0, len(cRanges))
+	goRanges := make([]ControlRange, 0, len(cRanges))
 	for _, r := range cRanges {
-		goRanges = append(goRanges, RustControlRange{
+		goRanges = append(goRanges, ControlRange{
 			FileOffset: uint64(r.file_offset),
 			Length:     uint64(r.length),
 			ShmOffset:  uint64(r.shm_offset),
@@ -296,7 +318,7 @@ func goSmartmapPageSynced(userdata unsafe.Pointer, offset C.size_t) C.int {
 	if userdata == nil {
 		return 0
 	}
-	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustSyncHandler)
+	handler, ok := cgo.Handle(uintptr(userdata)).Value().(SyncHandler)
 	if !ok || handler == nil {
 		return -1
 	}
@@ -310,7 +332,7 @@ func goSmartmapMutator(userdata unsafe.Pointer, pause bool) C.int {
 	if userdata == nil {
 		return 0
 	}
-	handler, ok := cgo.Handle(uintptr(userdata)).Value().(RustSyncHandler)
+	handler, ok := cgo.Handle(uintptr(userdata)).Value().(SyncHandler)
 	if !ok || handler == nil {
 		return -1
 	}

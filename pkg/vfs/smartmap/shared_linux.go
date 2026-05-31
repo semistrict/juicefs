@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"path"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -37,14 +38,17 @@ import (
 
 var uffdPagePool = sync.Pool{New: func() any { return make([]byte, uffdHugePageSize) }}
 
-const uffdRefaultProtectionMultiplier = 2
+const (
+	uffdBackgroundReclaimHighPercent = 80
+	uffdBackgroundReclaimLowPercent  = 70
+	uffdRefaultProtectionMultiplier  = 2
+)
 
 type uffdSharedCache struct {
 	mu                  sync.Mutex
 	fd                  int
 	mapped              []byte
 	next                uint64
-	seq                 uint64
 	free                []uint64
 	resident            int
 	maxResidentPages    int
@@ -55,8 +59,12 @@ type uffdSharedCache struct {
 	clock               uint64
 	control             uint64
 	probe               uint64
+	reclaiming          bool
+	closed              bool
+	reclaimCond         *sync.Cond
+	reclaimWG           sync.WaitGroup
 	pages               map[string]*uffdSharedPage
-	memories            map[string]*uffdMemory
+	memories            map[*uffdMemory]struct{}
 }
 
 type uffdSharedCacheOptions struct {
@@ -87,7 +95,6 @@ type uffdSharedPage struct {
 }
 
 type uffdMemory struct {
-	id       string
 	path     string
 	inode    vfs.Ino
 	size     uint64
@@ -104,7 +111,7 @@ type uffdSharedSession struct {
 	cache   *uffdSharedCache
 	memory  *uffdMemory
 	mapping []UFFDRegion
-	conn    *net.UnixConn
+	conn    smartmapConn
 	ctrlMu  sync.Mutex
 	uffdFd  int
 	connFd  int
@@ -120,6 +127,12 @@ type uffdEvictionTarget struct {
 	ranges  []uffdControlRange
 }
 
+type uffdControlRangeKey struct {
+	fileOffset uint64
+	length     uint64
+	shmOffset  uint64
+}
+
 type uffdProbeConfig struct {
 	candidates int
 	evict      int
@@ -132,7 +145,7 @@ func newUFFDSharedCache(options ...uffdSharedCacheOptions) *uffdSharedCache {
 	if len(options) > 0 {
 		opt = options[0]
 	}
-	return &uffdSharedCache{
+	cache := &uffdSharedCache{
 		fd:                  -1,
 		maxResidentPages:    opt.maxResidentPages,
 		evictionPolicy:      opt.evictionPolicy,
@@ -140,8 +153,10 @@ func newUFFDSharedCache(options ...uffdSharedCacheOptions) *uffdSharedCache {
 		probeEvictPages:     opt.probeEvictPages,
 		probeMonitorMillis:  opt.probeMonitorMillis,
 		pages:               make(map[string]*uffdSharedPage),
-		memories:            make(map[string]*uffdMemory),
+		memories:            make(map[*uffdMemory]struct{}),
 	}
+	cache.reclaimCond = sync.NewCond(&cache.mu)
+	return cache
 }
 
 func closeUFFDSharedFDs(fds []int) {
@@ -150,59 +165,59 @@ func closeUFFDSharedFDs(fds []int) {
 	}
 }
 
-func handleSmartmapSession(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{}, cache *uffdSharedCache, frame smartmapFrame, fds []int) {
+func handleSmartmapSession(v *vfs.VFS, conn smartmapConn, done <-chan struct{}, cache *uffdSharedCache, frame smartmapFrame, fds []int) {
 	if cache == nil {
 		closeUFFDSharedFDs(fds)
-		writeSmartmapFatal(conn, errors.New("smartmap shared memory cache is unavailable"))
+		conn.writeFatal(errors.New("smartmap shared memory cache is unavailable"))
 		return
 	}
-	ctx := vfs.NewLogContext(peerMetaContext(conn))
+	ctx := vfs.NewLogContext(peerMetaContext(conn.conn))
 	if frame.Type != smartmapFrameMap {
 		closeUFFDSharedFDs(fds)
-		writeSmartmapFatal(conn, fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameMap, frame.Type))
+		conn.writeFatal(fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameMap, frame.Type))
 		return
 	}
 	if len(fds) != 0 {
 		closeUFFDSharedFDs(fds)
-		writeSmartmapFatal(conn, fmt.Errorf("smartmap map expected no fds, got %d", len(fds)))
+		conn.writeFatal(fmt.Errorf("smartmap map expected no fds, got %d", len(fds)))
 		return
 	}
 	memory, err := cache.openMappedFile(v, ctx, frame.Path, frame.Size)
 	if err != nil {
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
 	defer func() {
-		if err := cache.closeMemory(memory.id); err != nil {
+		if err := cache.closeMemory(memory); err != nil {
 			logger.Warnf("close smartmap memory %s: %s", memory.path, err)
 		}
 	}()
 	clientFD, err := cache.openReadOnlyFD()
 	if err != nil {
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
 	mapped := smartmapFrame{Type: smartmapFrameMapped, Size: memory.size, PageSize: uffdHugePageSize, Extents: memory.extents}
-	err = writeSmartmapFrameWithFD(conn, mapped, clientFD)
+	err = conn.writeFrameWithFD(mapped, smartmapFDMemory, clientFD)
 	_ = unix.Close(clientFD)
 	if err != nil {
 		logger.Warnf("write smartmap mapped response for %s: %s", frame.Path, err)
 		return
 	}
 
-	attach, attachFDs, err := readSmartmapFrame(conn)
+	attach, attachFDs, err := conn.readFrame()
 	if err != nil {
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
 	if attach.Type != smartmapFrameAttach {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameAttach, attach.Type))
+		conn.writeFatal(fmt.Errorf("smartmap session expected %q frame, got %q", smartmapFrameAttach, attach.Type))
 		return
 	}
 	if len(attachFDs) != 1 || attach.FD != smartmapFDUFFD {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, fmt.Errorf("smartmap attach expected exactly one uffd fd, got purpose %q count %d", attach.FD, len(attachFDs)))
+		conn.writeFatal(fmt.Errorf("smartmap attach expected exactly one uffd fd, got purpose %q count %d", attach.FD, len(attachFDs)))
 		return
 	}
 	mapping := []UFFDRegion{{
@@ -213,18 +228,18 @@ func handleSmartmapSession(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{},
 	}}
 	if attach.Size != memory.size {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, fmt.Errorf("smartmap attach size %d does not match mapped size %d", attach.Size, memory.size))
+		conn.writeFatal(fmt.Errorf("smartmap attach size %d does not match mapped size %d", attach.Size, memory.size))
 		return
 	}
 	if err := validateUFFDSharedMappings(mapping); err != nil {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
-	connFd, err := unixConnFD(conn)
+	connFd, err := unixConnFD(conn.conn)
 	if err != nil {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
 	s := &uffdSharedSession{
@@ -233,10 +248,10 @@ func handleSmartmapSession(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{},
 	}
 	if err := cache.beginMemorySession(memory, s); err != nil {
 		closeUFFDSharedFDs(attachFDs)
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 		return
 	}
-	if err := writeSmartmapFrame(conn, smartmapFrame{Type: smartmapFrameAttached}); err != nil {
+	if err := conn.writeFrame(smartmapFrame{Type: smartmapFrameAttached}); err != nil {
 		cache.endMemorySession(memory, s)
 		closeUFFDSharedFDs(attachFDs)
 		return
@@ -245,7 +260,7 @@ func handleSmartmapSession(v *vfs.VFS, conn *net.UnixConn, done <-chan struct{},
 	cache.endMemorySession(memory, s)
 	if err != nil {
 		logger.Warnf("smartmap session for %s ended with error: %s", memory.path, err)
-		writeSmartmapFatal(conn, err)
+		conn.writeFatal(err)
 	}
 }
 
@@ -323,9 +338,7 @@ func (c *uffdSharedCache) openMappedFile(v *vfs.VFS, ctx vfs.LogContext, reqPath
 	}
 
 	c.mu.Lock()
-	c.seq++
-	memory.id = fmt.Sprintf("memory-%d", c.seq)
-	c.memories[memory.id] = memory
+	c.memories[memory] = struct{}{}
 	c.mu.Unlock()
 	return memory, nil
 }
@@ -394,8 +407,8 @@ func (c *uffdSharedCache) openReadOnlyFD() (int, error) {
 func (c *uffdSharedCache) beginMemorySession(memory *uffdMemory, session *uffdSharedSession) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if memory.closing || c.memories[memory.id] != memory {
-		return fmt.Errorf("smartmap memory %s is closing", memory.id)
+	if _, ok := c.memories[memory]; memory.closing || !ok {
+		return fmt.Errorf("smartmap memory %s is closing", memory.path)
 	}
 	memory.sessions++
 	memory.active[session] = struct{}{}
@@ -413,21 +426,20 @@ func (c *uffdSharedCache) endMemorySession(memory *uffdMemory, session *uffdShar
 	c.mu.Unlock()
 }
 
-func (c *uffdSharedCache) closeMemory(id string) error {
-	if id == "" {
-		return errors.New("smartmap memory handle is empty")
+func (c *uffdSharedCache) closeMemory(memory *uffdMemory) error {
+	if memory == nil {
+		return errors.New("smartmap memory is nil")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	memory := c.memories[id]
-	if memory == nil {
-		return fmt.Errorf("unknown smartmap memory handle: %s", id)
+	if _, ok := c.memories[memory]; !ok {
+		return fmt.Errorf("unknown smartmap memory: %s", memory.path)
 	}
 	if memory.closing {
-		return fmt.Errorf("smartmap memory %s is closing", id)
+		return fmt.Errorf("smartmap memory %s is closing", memory.path)
 	}
 	if memory.sessions > 0 {
-		return fmt.Errorf("smartmap memory %s has %d active uffd sessions", id, memory.sessions)
+		return fmt.Errorf("smartmap memory %s has %d active uffd sessions", memory.path, memory.sessions)
 	}
 	memory.closing = true
 	for _, page := range memory.pages {
@@ -436,7 +448,7 @@ func (c *uffdSharedCache) closeMemory(id string) error {
 			return err
 		}
 	}
-	delete(c.memories, id)
+	delete(c.memories, memory)
 	return nil
 }
 
@@ -539,11 +551,17 @@ func (c *uffdSharedCache) ensureMappedLocked() error {
 
 func (c *uffdSharedCache) close() {
 	c.mu.Lock()
+	c.closed = true
+	c.reclaimCond.Broadcast()
+	c.mu.Unlock()
+	c.reclaimWG.Wait()
+
+	c.mu.Lock()
 	fd := c.fd
 	c.fd = -1
 	mapped := c.mapped
 	c.mapped = nil
-	c.memories = make(map[string]*uffdMemory)
+	c.memories = make(map[*uffdMemory]struct{})
 	c.pages = make(map[string]*uffdSharedPage)
 	c.free = nil
 	c.resident = 0
@@ -788,6 +806,9 @@ func (s *uffdSharedSession) populatePage(page *uffdSharedPage) error {
 	page.loading = false
 	page.cond.Broadcast()
 	s.cache.mu.Unlock()
+	if err == nil {
+		s.cache.maybeStartBackgroundReclaim(page)
+	}
 	return err
 }
 
@@ -825,35 +846,179 @@ func (s *uffdSharedSession) ensureResidentCapacity(skip *uffdSharedPage) error {
 	if limit <= 0 {
 		return nil
 	}
+	blocked := make(map[*uffdSharedPage]struct{})
 	for {
+		s.cache.waitForBackgroundReclaim(limit)
 		if s.probeEvictionEnabled() {
-			victim, targets := s.cache.reserveProbeColdVictim(skip, limit)
+			victim, targets := s.cache.reserveProbeColdVictim(skip, blocked, limit)
 			if victim != nil {
-				if err := s.evictReservedPage(victim, targets); err != nil {
+				evicted, err := s.cache.evictReservedPages([]*uffdSharedPage{victim}, targets)
+				if err != nil {
 					return err
+				}
+				if evicted == 0 {
+					blocked[victim] = struct{}{}
 				}
 				continue
 			}
 		}
-		victim, targets := s.cache.reserveEvictionVictim(skip, limit)
+		victim, targets := s.cache.reserveEvictionVictim(skip, blocked, limit)
 		if victim == nil {
 			return nil
 		}
-		if err := s.evictReservedPage(victim, targets); err != nil {
+		evicted, err := s.cache.evictReservedPages([]*uffdSharedPage{victim}, targets)
+		if err != nil {
 			return err
 		}
+		if evicted == 0 {
+			blocked[victim] = struct{}{}
+		}
 	}
 }
 
-func (c *uffdSharedCache) reserveProbeColdVictim(skip *uffdSharedPage, limit int) (*uffdSharedPage, []uffdEvictionTarget) {
+func (c *uffdSharedCache) reserveProbeColdVictim(skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, limit int) (*uffdSharedPage, []uffdEvictionTarget) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if limit <= 0 || c.resident < limit {
 		return nil, nil
 	}
+	pages := c.reserveEvictionBatchLocked(skip, blocked, 1, true, false)
+	if len(pages) == 0 {
+		return nil, nil
+	}
+	return pages[0], c.controlTargetsLocked(pages)
+}
+
+func (c *uffdSharedCache) reserveEvictionVictim(skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, limit int) (*uffdSharedPage, []uffdEvictionTarget) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if limit <= 0 || c.resident < limit {
+		return nil, nil
+	}
+	pages := c.reserveEvictionBatchLocked(skip, blocked, 1, false, false)
+	if len(pages) == 0 {
+		pages = c.reserveEvictionBatchLocked(skip, blocked, 1, false, true)
+	}
+	if len(pages) == 0 {
+		return nil, nil
+	}
+	return pages[0], c.controlTargetsLocked(pages)
+}
+
+func (c *uffdSharedCache) maybeStartBackgroundReclaim(skip *uffdSharedPage) {
+	c.mu.Lock()
+	if !c.shouldStartBackgroundReclaimLocked() {
+		c.mu.Unlock()
+		return
+	}
+	c.reclaiming = true
+	c.reclaimWG.Add(1)
+	c.mu.Unlock()
+
+	go c.runBackgroundReclaim(skip)
+}
+
+func (c *uffdSharedCache) shouldStartBackgroundReclaimLocked() bool {
+	limit := c.maxResidentPages
+	if c.closed || c.reclaiming || limit <= 0 {
+		return false
+	}
+	high := c.backgroundReclaimHighPagesLocked()
+	target := c.backgroundReclaimTargetPagesLocked()
+	return c.resident >= high && c.resident > target
+}
+
+func (c *uffdSharedCache) backgroundReclaimHighPagesLocked() int {
+	return percentCeil(c.maxResidentPages, uffdBackgroundReclaimHighPercent)
+}
+
+func (c *uffdSharedCache) backgroundReclaimTargetPagesLocked() int {
+	limit := c.maxResidentPages
+	if limit <= 1 {
+		return limit
+	}
+	high := c.backgroundReclaimHighPagesLocked()
+	target := percentCeil(limit, uffdBackgroundReclaimLowPercent)
+	if target >= high {
+		target = high - 1
+	}
+	if target < 0 {
+		target = 0
+	}
+	return target
+}
+
+func percentCeil(n, percent int) int {
+	if n <= 0 {
+		return 0
+	}
+	return (n*percent + 99) / 100
+}
+
+func (c *uffdSharedCache) runBackgroundReclaim(skip *uffdSharedPage) {
+	defer func() {
+		c.mu.Lock()
+		c.reclaiming = false
+		c.reclaimCond.Broadcast()
+		c.mu.Unlock()
+		c.reclaimWG.Done()
+	}()
+
+	for {
+		pages, targets := c.reserveBackgroundReclaimBatch(skip)
+		if len(pages) == 0 {
+			return
+		}
+		evicted, err := c.evictReservedPages(pages, targets)
+		if err != nil {
+			logger.Warnf("background smartmap reclaim failed: %s", err)
+			return
+		}
+		if evicted == 0 {
+			return
+		}
+	}
+}
+
+func (c *uffdSharedCache) waitForBackgroundReclaim(limit int) {
+	c.mu.Lock()
+	for c.reclaiming && c.resident >= limit && !c.closed {
+		c.reclaimCond.Wait()
+	}
+	c.mu.Unlock()
+}
+
+func (c *uffdSharedCache) reserveBackgroundReclaimBatch(skip *uffdSharedPage) ([]*uffdSharedPage, []uffdEvictionTarget) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.maxResidentPages <= 0 {
+		return nil, nil
+	}
+	target := c.backgroundReclaimTargetPagesLocked()
+	if c.resident <= target {
+		return nil, nil
+	}
+	need := c.resident - target
+	var pages []*uffdSharedPage
+	if c.evictionPolicy == uffdEvictionPolicyProbe {
+		pages = c.reserveEvictionBatchLocked(skip, nil, need, true, false)
+	}
+	if len(pages) == 0 {
+		pages = c.reserveEvictionBatchLocked(skip, nil, need, false, false)
+	}
+	if len(pages) == 0 {
+		return nil, nil
+	}
+	return pages, c.controlTargetsLocked(pages)
+}
+
+func (c *uffdSharedCache) reserveEvictionBatchLocked(skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, maxPages int, probeColdOnly, allowProtected bool) []*uffdSharedPage {
+	if maxPages <= 0 {
+		return nil
+	}
 	var victim *uffdSharedPage
 	for _, page := range c.pages {
-		if page == skip || !page.populated || page.loading || page.evicting || page.probing || !page.probeCold || page.probeHit || c.refaultProtectedLocked(page) {
+		if !c.evictionCandidateLocked(page, skip, blocked, probeColdOnly, allowProtected) {
 			continue
 		}
 		if c.betterEvictionVictimLocked(page, victim) {
@@ -861,50 +1026,109 @@ func (c *uffdSharedCache) reserveProbeColdVictim(skip *uffdSharedPage, limit int
 		}
 	}
 	if victim == nil {
-		return nil, nil
+		return nil
 	}
-	victim.evicting = true
-	return victim, c.evictionTargetsLocked(victim)
+	score := c.evictionScoreLocked(victim)
+	pages := c.sequentialEvictionBatchLocked(victim, score, skip, blocked, maxPages, probeColdOnly, allowProtected)
+	if len(pages) == 0 {
+		pages = []*uffdSharedPage{victim}
+	}
+	for _, page := range pages {
+		page.evicting = true
+	}
+	return pages
 }
 
-func (c *uffdSharedCache) reserveEvictionVictim(skip *uffdSharedPage, limit int) (*uffdSharedPage, []uffdEvictionTarget) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if limit <= 0 || c.resident < limit {
-		return nil, nil
+func (c *uffdSharedCache) evictionCandidateLocked(page, skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, probeColdOnly, allowProtected bool) bool {
+	if page == nil || page == skip || !page.populated || page.loading || page.evicting || page.refs <= 0 {
+		return false
 	}
-	var victim *uffdSharedPage
-	for _, page := range c.pages {
-		if page == skip || !page.populated || page.loading || page.evicting || page.probing || c.refaultProtectedLocked(page) {
-			continue
-		}
-		if c.betterEvictionVictimLocked(page, victim) {
-			victim = page
+	if blocked != nil {
+		if _, ok := blocked[page]; ok {
+			return false
 		}
 	}
-	if victim == nil {
-		for _, page := range c.pages {
-			if page == skip || !page.populated || page.loading || page.evicting {
+	if probeColdOnly && (!page.probeCold || page.probeHit) {
+		return false
+	}
+	if !allowProtected && (page.probing || c.refaultProtectedLocked(page)) {
+		return false
+	}
+	return true
+}
+
+func (c *uffdSharedCache) sequentialEvictionBatchLocked(victim *uffdSharedPage, score int, skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, maxPages int, probeColdOnly, allowProtected bool) []*uffdSharedPage {
+	best := []*uffdSharedPage{victim}
+	for memory := range c.memories {
+		for fileOff, page := range memory.pages {
+			if page != victim {
 				continue
 			}
-			if c.betterEvictionVictimLocked(page, victim) {
-				victim = page
+			group := c.collectSequentialEvictionBatchLocked(memory, fileOff, score, skip, blocked, maxPages, probeColdOnly, allowProtected)
+			if len(group) > len(best) {
+				best = group
+				if len(best) >= maxPages {
+					return best
+				}
 			}
 		}
 	}
-	if victim == nil {
-		return nil, nil
+	return best
+}
+
+func (c *uffdSharedCache) collectSequentialEvictionBatchLocked(memory *uffdMemory, anchor uint64, score int, skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, maxPages int, probeColdOnly, allowProtected bool) []*uffdSharedPage {
+	seen := make(map[*uffdSharedPage]struct{}, maxPages)
+	backward := make([]*uffdSharedPage, 0, maxPages)
+	for off := anchor; off >= uffdHugePageSize && len(backward)+1 < maxPages; {
+		off -= uffdHugePageSize
+		page := memory.pages[off]
+		if !c.sameScoreEvictionCandidateLocked(page, score, skip, blocked, probeColdOnly, allowProtected) {
+			break
+		}
+		if _, ok := seen[page]; ok {
+			break
+		}
+		seen[page] = struct{}{}
+		backward = append(backward, page)
 	}
-	victim.evicting = true
-	return victim, c.evictionTargetsLocked(victim)
+	for i, j := 0, len(backward)-1; i < j; i, j = i+1, j-1 {
+		backward[i], backward[j] = backward[j], backward[i]
+	}
+	group := append([]*uffdSharedPage{}, backward...)
+	victim := memory.pages[anchor]
+	seen[victim] = struct{}{}
+	group = append(group, victim)
+	for off := anchor + uffdHugePageSize; len(group) < maxPages; off += uffdHugePageSize {
+		page := memory.pages[off]
+		if !c.sameScoreEvictionCandidateLocked(page, score, skip, blocked, probeColdOnly, allowProtected) {
+			break
+		}
+		if _, ok := seen[page]; ok {
+			break
+		}
+		seen[page] = struct{}{}
+		group = append(group, page)
+	}
+	return group
+}
+
+func (c *uffdSharedCache) sameScoreEvictionCandidateLocked(page *uffdSharedPage, score int, skip *uffdSharedPage, blocked map[*uffdSharedPage]struct{}, probeColdOnly, allowProtected bool) bool {
+	if !c.evictionCandidateLocked(page, skip, blocked, probeColdOnly, allowProtected) {
+		return false
+	}
+	return c.evictionScoreLocked(page) == score
+}
+
+func (c *uffdSharedCache) evictionScoreLocked(page *uffdSharedPage) int {
+	return c.activeMappingCountLocked(page)
 }
 
 func (c *uffdSharedCache) betterEvictionVictimLocked(page, victim *uffdSharedPage) bool {
 	if victim == nil {
 		return true
 	}
-	pageMappings := c.activeMappingCountLocked(page)
-	victimMappings := c.activeMappingCountLocked(victim)
+	pageMappings := c.evictionScoreLocked(page)
+	victimMappings := c.evictionScoreLocked(victim)
 	if pageMappings != victimMappings {
 		return pageMappings < victimMappings
 	}
@@ -913,7 +1137,7 @@ func (c *uffdSharedCache) betterEvictionVictimLocked(page, victim *uffdSharedPag
 
 func (c *uffdSharedCache) activeMappingCountLocked(page *uffdSharedPage) int {
 	mappings := 0
-	for _, memory := range c.memories {
+	for memory := range c.memories {
 		for _, memoryPage := range memory.pages {
 			if memoryPage != page {
 				continue
@@ -924,17 +1148,13 @@ func (c *uffdSharedCache) activeMappingCountLocked(page *uffdSharedPage) int {
 	return mappings
 }
 
-func (c *uffdSharedCache) evictionTargetsLocked(page *uffdSharedPage) []uffdEvictionTarget {
-	return c.controlTargetsLocked([]*uffdSharedPage{page})
-}
-
 func (c *uffdSharedCache) controlTargetsLocked(pages []*uffdSharedPage) []uffdEvictionTarget {
 	pageSet := make(map[*uffdSharedPage]struct{}, len(pages))
 	for _, page := range pages {
 		pageSet[page] = struct{}{}
 	}
 	bySession := make(map[*uffdSharedSession][]uffdControlRange)
-	for _, memory := range c.memories {
+	for memory := range c.memories {
 		for fileOff, memoryPage := range memory.pages {
 			if _, ok := pageSet[memoryPage]; !ok {
 				continue
@@ -950,6 +1170,12 @@ func (c *uffdSharedCache) controlTargetsLocked(pages []*uffdSharedPage) []uffdEv
 	}
 	targets := make([]uffdEvictionTarget, 0, len(bySession))
 	for session, ranges := range bySession {
+		sort.Slice(ranges, func(i, j int) bool {
+			if ranges[i].FileOffset != ranges[j].FileOffset {
+				return ranges[i].FileOffset < ranges[j].FileOffset
+			}
+			return ranges[i].ShmOffset < ranges[j].ShmOffset
+		})
 		targets = append(targets, uffdEvictionTarget{session: session, ranges: ranges})
 	}
 	return targets
@@ -1120,41 +1346,65 @@ func (c *uffdSharedCache) finishProbeRound(seq uint64, pages []*uffdSharedPage) 
 	}
 }
 
-func (s *uffdSharedSession) evictReservedPage(page *uffdSharedPage, targets []uffdEvictionTarget) error {
+func (c *uffdSharedCache) evictReservedPages(pages []*uffdSharedPage, targets []uffdEvictionTarget) (int, error) {
+	blocked := make(map[uint64]struct{})
 	for _, target := range targets {
 		released, err := target.session.requestRelease(target.ranges)
 		if err != nil {
 			if isUFFDControlClosedErr(err) {
 				continue
 			}
-			s.cache.cancelEviction(page, err)
-			return err
+			c.cancelEvictions(pages, err)
+			return 0, err
 		}
-		if !controlRangesCover(target.ranges, released) {
-			s.cache.cancelEviction(page, nil)
-			return nil
+		releasedSet := controlRangeSet(released)
+		for _, want := range target.ranges {
+			if _, ok := releasedSet[controlRangeKey(want)]; !ok {
+				blocked[want.ShmOffset] = struct{}{}
+			}
 		}
 	}
-	s.cache.mu.Lock()
-	defer s.cache.mu.Unlock()
-	if page.refs <= 0 || s.cache.pages[page.key] != page {
-		s.cache.finishEvictionLocked(page, nil)
-		return nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	evicted := 0
+	for _, page := range pages {
+		if page.refs <= 0 || c.pages[page.key] != page {
+			c.finishEvictionLocked(page, nil)
+			continue
+		}
+		if _, ok := blocked[page.shmOff]; ok {
+			c.finishEvictionLocked(page, nil)
+			continue
+		}
+		err := c.discardSlotLocked(page.shmOff)
+		if err != nil {
+			c.finishEvictionLocked(page, err)
+			return evicted, err
+		}
+		page.populated = false
+		if c.resident > 0 {
+			c.resident--
+		}
+		page.evictedAt = c.clock
+		page.protected = 0
+		c.clearProbeLocked(page)
+		c.finishEvictionLocked(page, nil)
+		evicted++
 	}
-	err := s.cache.discardSlotLocked(page.shmOff)
-	if err != nil {
-		s.cache.finishEvictionLocked(page, err)
-		return err
+	c.reclaimCond.Broadcast()
+	return evicted, nil
+}
+
+func controlRangeSet(ranges []uffdControlRange) map[uffdControlRangeKey]struct{} {
+	set := make(map[uffdControlRangeKey]struct{}, len(ranges))
+	for _, r := range ranges {
+		set[controlRangeKey(r)] = struct{}{}
 	}
-	page.populated = false
-	if s.cache.resident > 0 {
-		s.cache.resident--
-	}
-	page.evictedAt = s.cache.clock
-	page.protected = 0
-	s.cache.clearProbeLocked(page)
-	s.cache.finishEvictionLocked(page, nil)
-	return nil
+	return set
+}
+
+func controlRangeKey(r uffdControlRange) uffdControlRangeKey {
+	return uffdControlRangeKey{fileOffset: r.FileOffset, length: r.Length, shmOffset: r.ShmOffset}
 }
 
 func controlRangesCover(want, got []uffdControlRange) bool {
@@ -1177,6 +1427,15 @@ func (c *uffdSharedCache) cancelEviction(page *uffdSharedPage, err error) {
 	c.mu.Lock()
 	c.finishEvictionLocked(page, err)
 	c.mu.Unlock()
+}
+
+func (c *uffdSharedCache) cancelEvictions(pages []*uffdSharedPage, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, page := range pages {
+		c.finishEvictionLocked(page, err)
+	}
+	c.reclaimCond.Broadcast()
 }
 
 func (c *uffdSharedCache) finishEvictionLocked(page *uffdSharedPage, err error) {
@@ -1241,10 +1500,10 @@ func (s *uffdSharedSession) requestControl(messageType string, ranges []uffdCont
 	s.ctrlMu.Lock()
 	defer s.ctrlMu.Unlock()
 
-	if err := writeSmartmapFrame(s.conn, smartmapFrame{Type: messageType, Ranges: ranges}); err != nil {
+	if err := s.conn.writeFrame(smartmapFrame{Type: messageType, Ranges: ranges}); err != nil {
 		return smartmapFrame{}, fmt.Errorf("send smartmap %s request: %w", messageType, err)
 	}
-	ack, fds, err := readSmartmapFrame(s.conn)
+	ack, fds, err := s.conn.readFrame()
 	if err != nil {
 		return smartmapFrame{}, fmt.Errorf("read smartmap %s ack: %w", messageType, err)
 	}
@@ -1262,72 +1521,6 @@ func (s *uffdSharedSession) requestControl(messageType string, ranges []uffdCont
 		return smartmapFrame{}, errors.New(ack.Error)
 	}
 	return ack, nil
-}
-
-func (s *uffdSharedSession) refreshMemoryRanges(ranges []uffdControlRange) error {
-	ctx := vfs.NewLogContext(meta.Background())
-	attr := &vfs.Attr{}
-	if st := s.v.Meta.GetAttr(ctx, s.memory.inode, attr); st != 0 {
-		return fmt.Errorf("getattr inode %d after client writeback: %w", s.memory.inode, st)
-	}
-	if attr.Typ != meta.TypeFile {
-		return fmt.Errorf("memory inode %d is no longer a file", s.memory.inode)
-	}
-	for _, r := range ranges {
-		if r.FileOffset%uffdHugePageSize != 0 || r.Length != uffdHugePageSize {
-			return fmt.Errorf("refresh range at %d has invalid length %d", r.FileOffset, r.Length)
-		}
-		old := s.memory.pages[r.FileOffset]
-		if old == nil {
-			return fmt.Errorf("refresh range at %d is outside memory %s", r.FileOffset, s.memory.id)
-		}
-		source, err := captureUFFDPageSource(s.v, ctx, s.memory.inode, attr.Length, r.FileOffset)
-		if err != nil {
-			return err
-		}
-		if old.key == source.key {
-			continue
-		}
-		page, err := s.cache.pageForKey(source.key, source)
-		if err != nil {
-			return err
-		}
-		if err := s.cache.replaceMemoryPage(s.memory, r.FileOffset, page); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *uffdSharedCache) replaceMemoryPage(memory *uffdMemory, fileOff uint64, page *uffdSharedPage) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	old := memory.pages[fileOff]
-	if old == nil {
-		c.releasePageLocked(page)
-		return fmt.Errorf("page offset %d is outside memory %s", fileOff, memory.id)
-	}
-	if old == page {
-		return nil
-	}
-	memory.pages[fileOff] = page
-	memory.extents = rebuildUFFDMemoryExtents(memory)
-	if err := c.releasePageLocked(old); err != nil {
-		return err
-	}
-	return nil
-}
-
-func rebuildUFFDMemoryExtents(memory *uffdMemory) []UFFDExtent {
-	extents := make([]UFFDExtent, 0, len(memory.pages))
-	for off := uint64(0); off < memory.size; off += uffdHugePageSize {
-		page := memory.pages[off]
-		if page == nil {
-			continue
-		}
-		extents = appendUFFDExtent(extents, UFFDExtent{FileOffset: off, Length: uffdHugePageSize, ShmOffset: page.shmOff})
-	}
-	return extents
 }
 
 func (s *uffdSharedSession) readSharedPage(buf []byte, source uffdPageSource) error {
