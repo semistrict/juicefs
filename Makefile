@@ -83,7 +83,13 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test
+.PHONY: snapshot release debug test smartmap-rust test-smartmap
+smartmap-rust:
+	CARGO_TARGET_DIR=$$(readlink sdk/rust/smartmap/target 2>/dev/null || echo sdk/rust/smartmap/target) cargo build --manifest-path sdk/rust/smartmap/Cargo.toml
+
+test-smartmap: smartmap-rust
+	go test ./pkg/vfs/smartmap
+
 snapshot:
 	docker run --rm --privileged \
 		-e REVISIONDATE=$(REVISIONDATE) \

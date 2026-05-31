@@ -53,6 +53,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/juicedata/juicefs/pkg/vfs/smartmap"
 )
 
 var mountPid int
@@ -494,6 +495,14 @@ func mountFlags() []cli.Flag {
 		selfFlags = append(selfFlags, &cli.BoolFlag{
 			Name:  "disable-transparent-hugepage",
 			Usage: "disable transparent huge page to avoid latency spikes caused by kernel's memory compaction",
+		})
+		selfFlags = append(selfFlags, &cli.StringFlag{
+			Name:  "smartmap-socket",
+			Usage: "Unix socket path for Smartmap shared memory",
+		})
+		selfFlags = append(selfFlags, &cli.StringFlag{
+			Name:  "smartmap-resident-size",
+			Usage: "max resident Smartmap clean page memory",
 		})
 	}
 	return append(selfFlags, fuseFlags()...)
@@ -1136,6 +1145,10 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Warnf("On kernel versions below 5.11 (current: %d.%d), negative-entry-cache may cause concurrent check-then-create operations (e.g. mkdir -p) to fail in a distributed environment", major, minor)
 	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
+	if runtime.GOOS == "linux" {
+		conf.SmartmapSocket = c.String("smartmap-socket")
+		conf.SmartmapResidentSize = utils.ParseBytes(c, "smartmap-resident-size", 'B')
+	}
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
 	if allSquash != "" || rootSquash != "" {
@@ -1153,6 +1166,15 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		}
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
+	if conf.SmartmapSocket != "" {
+		stopUFFD, err := smartmap.StartWithOptions(v, conf.SmartmapSocket, smartmap.Options{
+			ResidentSize: conf.SmartmapResidentSize,
+		})
+		if err != nil {
+			logger.Fatalf("smartmap socket: %s", err)
+		}
+		defer stopUFFD()
+	}
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
 	if err != nil {
 		logger.Fatalf("fuse: %s", err)
